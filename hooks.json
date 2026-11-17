@@ -1,0 +1,19 @@
+{
+  "agy-model-inspector-hook": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node --no-warnings ./scripts/pre_invocation_hook.mjs",
+        "timeout": 10
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "node --no-warnings ./scripts/post_invocation_hook.mjs",
+        "timeout": 10
+      }
+    ]
+  }
+}

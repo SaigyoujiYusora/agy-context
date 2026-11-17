@@ -1,0 +1,23 @@
+{
+  "command": "node",
+  "args": ["--no-warnings", "server.mjs"],
+  "restart_policy": "always",
+  "display_name": "AGY Context 面板",
+  "description": "dsh-context 风格四标签页实时透视面板 (Context / Browser / Insights / Fleet) 与 DSH 会话统计 (正文 Token ÷ 流式时长、工具调用用时、缓存命中与真实模型 ID)。",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "AGY Context 面板",
+    "views": [
+      {
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_SIDEBAR",
+        "path": "/sidebar",
+        "title": "AGY Context"
+      },
+      {
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "path": "/",
+        "title": "AGY Context"
+      }
+    ]
+  }
+}

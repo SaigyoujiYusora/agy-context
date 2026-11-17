@@ -1,0 +1,24 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Logs & temporary files
+*.log
+*.tmp
+*.bak
+
+# Runtime / local backup artifacts
+outputs/
+backup-*/
+plugin_data/
+
+# Node / Python caches
+node_modules/
+__pycache__/
+*.pyc
+.venv/
