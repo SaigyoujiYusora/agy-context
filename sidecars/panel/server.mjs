@@ -44,7 +44,6 @@ const RULES_FILE = path.resolve(__dirname, '..', '..', 'rules', 'AGENTS.md');
 const UI_HTML_FILE = path.join(__dirname, 'ui.html');
 const DSH_HOST_FILE = path.join(__dirname, 'dsh_host.js');
 const VENDOR_DIR = path.join(__dirname, 'vendor');
-const ASSETS_DIR = path.resolve(__dirname, '..', '..', 'assets');
 
 function readJsonBody(req) {
   return new Promise((resolve) => {
@@ -433,23 +432,6 @@ async function handleRequest(req, res) {
     }
     res.writeHead(200, {
       'Content-Type': fileName.endsWith('.js') ? 'application/javascript; charset=utf-8' : 'text/plain; charset=utf-8',
-      'Cache-Control': 'public, max-age=3600'
-    });
-    res.end(fs.readFileSync(fullPath));
-    return;
-  }
-
-  if (req.method === 'GET' && url.pathname.startsWith('/assets/')) {
-    const fileName = path.basename(url.pathname.slice('/assets/'.length));
-    const allowed = new Set(['antigravity.png', 'logo.svg']);
-    const fullPath = path.join(ASSETS_DIR, fileName);
-    if (!allowed.has(fileName) || !fs.existsSync(fullPath)) {
-      res.writeHead(404);
-      res.end('asset missing');
-      return;
-    }
-    res.writeHead(200, {
-      'Content-Type': fileName.endsWith('.png') ? 'image/png' : 'image/svg+xml; charset=utf-8',
       'Cache-Control': 'public, max-age=3600'
     });
     res.end(fs.readFileSync(fullPath));

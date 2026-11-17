@@ -50,10 +50,12 @@ node --no-warnings "$HOME/.gemini/config/plugins/agy-model-inspector/scripts/cli
 - `--badge-mode on_reply | every_step | off`：切换对话内徽章模式
 - `--tps-mode decode | e2e`：切换纯 Decode / 含 TTFT 的 TPS 计算口径
 
-## 致谢与开源协议
+## 致谢与声明
 
-本项目的前端透视面板与状态栏图标复用/参考了以下开源项目与组件，并严格遵循其各自开源协议保留版权与许可声明：
+界面中用于产品标识的 **Google Gemini** 与 **Google Antigravity** 官方品牌图标（矢量路径）不在本仓库开源协议授权范围内，其商标与图形版权归原权利人 Google 所有。
 
-- **[dsh-context](https://github.com/bowenliang123/dsh-context)** (`v0.83.1`, Copyright 2025 `bowenliang123`) — 遵循 **Apache License 2.0**，完整协议文本见 [sidecars/panel/vendor/LICENSE.dsh-context](sidecars/panel/vendor/LICENSE.dsh-context)。
+本项目的前端透视面板与状态栏图标复用/参考了以下开源项目与组件，并保留其各自版权与许可声明：
+
+- **[dsh-context](https://github.com/bowenliang123/dsh-context)** (`v0.83.1`, Copyright 2025 `bowenliang123`) — 遵循 **Apache License 2.0**（已做面向 Antigravity 的适配修改并保留原版权与修改标注），完整协议文本见 [sidecars/panel/vendor/LICENSE.dsh-context](sidecars/panel/vendor/LICENSE.dsh-context)。
 - **DeepSeek Harness UI 图标与进度环几何**（来自 `DeepSeek Harness 0.2.2-rc.2` `@deepseek-ai/dsh-web-frontend` 与 `@deepseek-ai/dsh-client-ui-conversation`，Copyright (c) 2026 DeepSeek）— 遵循 **MIT License**，完整协议文本见 [sidecars/panel/vendor/LICENSE.dsh-icons](sidecars/panel/vendor/LICENSE.dsh-icons)。
 - **React & ReactDOM** (`v18.3.1`, Copyright (c) Facebook, Inc. and its affiliates) — 遵循 **MIT License**。
