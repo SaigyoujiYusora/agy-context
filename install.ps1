@@ -1,7 +1,7 @@
 #requires -Version 7.0
 <#
 .SYNOPSIS
-    Installs or uninstalls AGY Model Inspector in ~/.gemini/config/plugins/agy-model-inspector
+    Installs or uninstalls AGY Context in ~/.gemini/config/plugins/agy-model-inspector
     so Antigravity automatically discovers it in the plugin list, and manages the local backend.
 #>
 [CmdletBinding()]
@@ -31,27 +31,26 @@ function Stop-InspectorProcesses {
         } catch {}
     }
 
-    try { Invoke-RestMethod -Uri "http://127.0.0.1:$badgePort/api/shutdown" -TimeoutSec 1 | Out-Null } catch {}
-    if ($sidecarPort -ne $badgePort) {
-        try { Invoke-RestMethod -Uri "http://127.0.0.1:$sidecarPort/api/shutdown" -TimeoutSec 1 | Out-Null } catch {}
-    }
-
+    # Stop runtime-injector before restarting server.mjs to avoid a race where
+    # Antigravity auto-restarts sidecar -> spawns injector -> old cleanup kills it.
     $injectorPids = @()
     try {
         $injectorPids += (Get-NetTCPConnection -LocalPort 18923 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess)
     } catch {}
     try {
-        $injectorPids += (Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        $injectorPids += (Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -like '*agy-model-inspector*runtime-injector.mjs*' } |
             Select-Object -ExpandProperty ProcessId)
     } catch {}
     foreach ($ipid in ($injectorPids | Where-Object { $_ -gt 0 } | Select-Object -Unique)) {
         try {
-            $iproc = Get-CimInstance Win32_Process -Filter "ProcessId = $ipid" -ErrorAction SilentlyContinue
-            if ($iproc -and $iproc.CommandLine -like '*agy-model-inspector*' -and $iproc.CommandLine -like '*runtime-injector.mjs*') {
-                Stop-Process -Id $iproc.ProcessId -Force -ErrorAction SilentlyContinue
-            }
+            Stop-Process -Id $ipid -Force -ErrorAction SilentlyContinue
         } catch {}
+    }
+
+    try { Invoke-RestMethod -Uri "http://127.0.0.1:$badgePort/api/shutdown" -TimeoutSec 1 | Out-Null } catch {}
+    if ($sidecarPort -ne $badgePort) {
+        try { Invoke-RestMethod -Uri "http://127.0.0.1:$sidecarPort/api/shutdown" -TimeoutSec 1 | Out-Null } catch {}
     }
 
     return @{
@@ -123,6 +122,8 @@ Start-Sleep -Milliseconds 300
 
 $node = (Get-Command node -ErrorAction Stop).Source
 $serverScript = Join-Path $targetDir 'sidecars\panel\server.mjs'
+$injectorScript = Join-Path $targetDir 'scripts\runtime-injector.mjs'
+
 if (Test-Path -LiteralPath $serverScript) {
     $psi = [System.Diagnostics.ProcessStartInfo]::new($node, "--no-warnings `"$serverScript`"")
     $psi.UseShellExecute = $false
@@ -131,5 +132,19 @@ if (Test-Path -LiteralPath $serverScript) {
     if ($procInfo.LsAddress) { $psi.Environment['ANTIGRAVITY_LS_ADDRESS'] = $procInfo.LsAddress }
     if ($procInfo.CsrfToken) { $psi.Environment['ANTIGRAVITY_CSRF_TOKEN'] = $procInfo.CsrfToken }
     [System.Diagnostics.Process]::Start($psi) | Out-Null
-    Write-Host "Started backend server on http://127.0.0.1:$($procInfo.BadgePort) (runtime-injector auto-starts with it)." -ForegroundColor Cyan
+    Write-Host "Started backend server on http://127.0.0.1:$($procInfo.BadgePort)." -ForegroundColor Cyan
+}
+
+# Ensure runtime-injector (18923) is running even if Antigravity's auto-restarted sidecar already claimed 18922.
+Start-Sleep -Milliseconds 600
+$injectorUp = $false
+try {
+    $injectorUp = [bool](Get-NetTCPConnection -LocalPort 18923 -ErrorAction SilentlyContinue)
+} catch {}
+if (-not $injectorUp -and (Test-Path -LiteralPath $injectorScript)) {
+    $ipsi = [System.Diagnostics.ProcessStartInfo]::new($node, "--no-warnings `"$injectorScript`"")
+    $ipsi.UseShellExecute = $false
+    $ipsi.CreateNoWindow = $true
+    [System.Diagnostics.Process]::Start($ipsi) | Out-Null
+    Write-Host "Started CDP runtime injector (port 18923)." -ForegroundColor Cyan
 }
