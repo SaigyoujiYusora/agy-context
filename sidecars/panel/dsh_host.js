@@ -1064,6 +1064,21 @@
     } catch {}
   }
 
+  function formatStepRange(stepIndices, lastStepIndex) {
+    const nums = Array.isArray(stepIndices)
+      ? [...new Set(stepIndices.map(Number).filter(Number.isFinite))].sort((a, b) => a - b)
+      : [];
+    if (nums.length === 0) {
+      const fallback = lastStepIndex ?? '-';
+      return { text: String(fallback), title: String(fallback) };
+    }
+    if (nums.length === 1) {
+      const single = String(nums[0]);
+      return { text: single, title: single };
+    }
+    return { text: `${nums[0]}-${nums[nums.length - 1]}`, title: nums.join(',') };
+  }
+
   function InvocationsTableTab({ conversationId, summary, fleetUsage, config }) {
     const [mode, setMode] = React.useState(() => (readInvPref('agy.invTable.mode', 'lazy') === 'paged' ? 'paged' : 'lazy'));
     const [pageSize, setPageSize] = React.useState(() => {
@@ -1438,7 +1453,7 @@
                   h('thead', null,
                     h('tr', null,
                       h('th', null, data.hasSubagents ? '# / Agent' : '#'),
-                      h('th', null, 'Step'),
+                      h('th', { className: 'agy-col-step' }, 'Step'),
                       h('th', null, '发往上游 sentModel'),
                       h('th', null, 'SSE 返回 responseModel'),
                       h('th', null, 'TTFT / 流式'),
@@ -1458,6 +1473,7 @@
                       const timeStr = fmtClockHms(inv.timestampMs);
                       const isFocusedAgent = Boolean(inv.agentId && scope === `agent:${inv.agentId}`);
                       const hue = AGENT_FLEET_HUES[(Number(inv.agentHueIndex) || 0) % AGENT_FLEET_HUES.length];
+                      const stepInfo = formatStepRange(inv.stepIndices, inv.lastStepIndex);
                       return h('tr', { key: `${inv.agentId || 'self'}-${inv.seqNum || i}-${inv.requestId || i}` },
                         h('td', { className: 'mono dim agy-col-seq' },
                           data.hasSubagents
@@ -1479,7 +1495,9 @@
                             : h('div', null, `#${inv.seqNum || (i + 1)}`),
                           timeStr ? h('div', { className: 'agy-sub-label' }, timeStr) : null
                         ),
-                        h('td', { className: 'mono' }, Array.isArray(inv.stepIndices) && inv.stepIndices.length ? inv.stepIndices.join(',') : (inv.lastStepIndex ?? '-')),
+                        h('td', { className: 'mono agy-col-step' },
+                          h('span', { className: 'agy-step-text', title: stepInfo.title }, stepInfo.text)
+                        ),
                         h('td', { className: 'mono' },
                           h('span', { className: 'agy-model-chip' }, sent),
                           inv.modelDisplayName ? h('div', { className: 'agy-sub-label' }, inv.modelDisplayName) : null

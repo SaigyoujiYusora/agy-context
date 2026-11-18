@@ -770,6 +770,15 @@
     .agy-tps-ok { font-weight: 600; color: #16a34a; }
     body[data-ds-dark-theme] .agy-tps-ok { color: #4ade80; }
     .agy-col-seq { white-space: nowrap; width: 1%; }
+    .agy-col-step { white-space: nowrap; width: 1%; }
+    .agy-step-text {
+      display: inline-block;
+      max-width: 10ch;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: top;
+    }
     .agy-seq-agent-row {
       display: inline-flex;
       align-items: center;
@@ -934,7 +943,7 @@
   <div id="app-root"></div>
   <script src="/vendor/react.production.min.js"></script>
   <script src="/vendor/react-dom.production.min.js"></script>
-  <script src="/dsh_host.js"></script>
+  <script src="/dsh_host.js?v=1.2.5"></script>
   <script src="/vendor/dsh-context-client.js?v=1.2.4"></script>
   <script>if (window.__AGY_DSH_HOST__) window.__AGY_DSH_HOST__.initHost();</script>
 </body>
