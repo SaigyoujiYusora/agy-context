@@ -625,6 +625,11 @@ async function handleRequest(req, res) {
     }
   }
 
+  if (url.pathname === '/api/health') {
+    sendJson(res, 200, { ok: true, pid: process.pid, port, lsAddress: lsAddr || '', directOverlay: process.env.AGY_DISABLE_RUNTIME_INJECTOR === '1' });
+    return;
+  }
+
   if (url.pathname === '/api/shutdown') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ ok: true, pid: process.pid }));
@@ -664,6 +669,28 @@ server.listen(port, '127.0.0.1', () => {
 });
 
 if (port !== BADGE_PORT) {
+  let evictedStaleOnce = false;
+  const tryEvictStaleBadgeHolder = () => {
+    if (evictedStaleOnce || !lsAddr) return false;
+    evictedStaleOnce = true;
+    const probeReq = http.get({ hostname: '127.0.0.1', port: BADGE_PORT, path: '/api/health', timeout: 1000 }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        let info = null;
+        try { info = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch {}
+        const stale = !info || (Number(info.pid) !== process.pid && info.lsAddress !== lsAddr);
+        if (stale) {
+          const shutReq = http.get({ hostname: '127.0.0.1', port: BADGE_PORT, path: '/api/shutdown', timeout: 1000 }, () => {});
+          shutReq.on('error', () => {});
+          const retryFast = setTimeout(tryBindBadgePort, 450);
+          retryFast.unref();
+        }
+      });
+    });
+    probeReq.on('error', () => {});
+    return true;
+  };
   const tryBindBadgePort = () => {
     const badgeServer = http.createServer((req, res) => {
       handleRequest(req, res).catch(() => {
@@ -672,6 +699,7 @@ if (port !== BADGE_PORT) {
     });
     badgeServer.on('error', (err) => {
       if (err.code === 'EADDRINUSE') {
+        tryEvictStaleBadgeHolder();
         const retryTimer = setTimeout(tryBindBadgePort, 10000);
         retryTimer.unref();
       }
