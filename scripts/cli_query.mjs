@@ -43,16 +43,12 @@ if (!targetId) {
   } catch {}
 }
 
-const setBadgeMode = getArg('--badge-mode') || getArg('--mode');
 const setTpsMode = getArg('--tps-mode');
-if ((setBadgeMode && ['on_reply', 'every_step', 'off'].includes(setBadgeMode)) || (setTpsMode && ['decode', 'e2e'].includes(setTpsMode))) {
-  const patch = {};
-  if (setBadgeMode && ['on_reply', 'every_step', 'off'].includes(setBadgeMode)) patch.badgeMode = setBadgeMode;
-  if (setTpsMode && ['decode', 'e2e'].includes(setTpsMode)) patch.tpsMode = setTpsMode;
-  const updated = savePluginConfig(patch);
+if (setTpsMode && ['decode', 'e2e'].includes(setTpsMode)) {
+  const updated = savePluginConfig({ tpsMode: setTpsMode });
   const cur = targetId ? getConversationModelsFromDb(targetId) : null;
   syncConversationRulesSnapshot(RULES_FILE, targetId, cur?.latestModel || null, updated);
-  console.log(`已更新配置: badgeMode=${updated.badgeMode}, tpsMode=${updated.tpsMode}`);
+  console.log(`已更新配置: tpsMode=${updated.tpsMode}`);
   process.exit(0);
 }
 
@@ -122,7 +118,7 @@ if (current && current.latestModel) {
   lines.push(`| **当前上下文窗口占用** | \`${ctxPct}\` | 当前会话上下文水位 |`);
   lines.push(`| **本会话调用总次数** | \`${current.invocationCount}\` 次 | 累计入 \`${current.totals.inputTokens.toLocaleString()}\` / 缓存 \`${current.totals.cacheReadTokens.toLocaleString()}\` (${cacheRate}) / 出 \`${current.totals.outputTokens.toLocaleString()}\` |`);
   lines.push(`| **最新请求 Trace / Response ID** | \`${lm.traceId || 'N/A'}\` / \`${lm.responseId || 'N/A'}\` | 请求序号: \`${lm.requestId || 'N/A'}\` |`);
-  lines.push(`| **当前配置 (\`badgeMode\` / \`tpsMode\`)** | \`${cfg.badgeMode}\` / \`${cfg.tpsMode || 'decode'}\` | 支持 \`--tps-mode decode\\|e2e\` 一键切换 |`);
+  lines.push(`| **TPS 统计口径 (\`tpsMode\`)** | \`${cfg.tpsMode || 'decode'}\` | 支持 \`--tps-mode decode\\|e2e\` 一键切换 |`);
   lines.push('');
 
   if (analytics?.sessionStats) {

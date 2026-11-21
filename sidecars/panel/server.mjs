@@ -8,8 +8,6 @@ import { getPromptProfiles, savePromptProfiles, getPromptSources, getNativePromp
 import {
   PLUGIN_DATA_DIR,
   BADGE_PORT,
-  BADGE_BINDINGS_FILE,
-  ensurePluginDataDir,
   getConversationModelsFromDb,
   listRecentConversations,
   getPluginConfig,
@@ -17,10 +15,6 @@ import {
   saveLsEndpoint,
   loadLsEndpoint,
   readInflightState,
-  resolveModelByEnum,
-  renderInlineBadgeSvg,
-  renderUsageBadgeSvg,
-  renderForkBadgeSvg,
   syncConversationRulesSnapshot,
   getSessionTranscriptAnalytics,
   getFleetHierarchy,
@@ -99,175 +93,6 @@ function getActiveConversationId() {
     }
   } catch {}
   return '';
-}
-
-function loadBadgeBindings() {
-  try {
-    if (fs.existsSync(BADGE_BINDINGS_FILE)) {
-      return JSON.parse(fs.readFileSync(BADGE_BINDINGS_FILE, 'utf8'));
-    }
-  } catch {}
-  return {};
-}
-
-let badgeBindings = loadBadgeBindings();
-const pendingBadgePromises = new Map();
-
-function persistBadgeBinding(bindKey, entry) {
-  if (!bindKey || !entry) return;
-  badgeBindings[bindKey] = entry;
-  try {
-    ensurePluginDataDir();
-    const keys = Object.keys(badgeBindings);
-    if (keys.length > 2000) {
-      for (const oldKey of keys.slice(0, keys.length - 2000)) {
-        delete badgeBindings[oldKey];
-      }
-    }
-    fs.writeFileSync(BADGE_BINDINGS_FILE, JSON.stringify(badgeBindings), 'utf8');
-  } catch {}
-}
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
-async function resolveBadgeInvocation(cid, k, explicitIdx) {
-  if (!cid) return null;
-
-  const bindKey = k ? `${cid}:${k}` : (explicitIdx !== null && explicitIdx !== undefined && explicitIdx !== '' ? `${cid}:idx_${explicitIdx}` : '');
-  if (bindKey && badgeBindings[bindKey]?.snapshot) {
-    const cachedEntry = badgeBindings[bindKey];
-    // Auto-upgrade legacy cached snapshots created before `tpsApprox` / `bodyOutputTokens` existed
-    if ((cachedEntry.snapshot.tpsApprox === undefined || cachedEntry.snapshot.bodyOutputTokens === undefined) && Number.isFinite(Number(cachedEntry.idx))) {
-      const refreshedSummary = getConversationModelsFromDb(cid);
-      const freshSnap = refreshedSummary?.invocations?.[Number(cachedEntry.idx)];
-      if (freshSnap) {
-        persistBadgeBinding(bindKey, { idx: Number(cachedEntry.idx), boundAt: cachedEntry.boundAt || Date.now(), snapshot: freshSnap });
-        return freshSnap;
-      }
-    }
-    return cachedEntry.snapshot;
-  }
-
-  if (bindKey && pendingBadgePromises.has(bindKey)) {
-    return pendingBadgePromises.get(bindKey);
-  }
-
-  // Deterministic `idx` binding: wait up to 5.5s for exact row `idxNum` to commit to SQLite WAL
-  if (explicitIdx !== null && explicitIdx !== undefined && explicitIdx !== '' && Number.isFinite(Number(explicitIdx))) {
-    const idxNum = Number(explicitIdx);
-    const idxWork = (async () => {
-      const deadline = Date.now() + 5500;
-      while (Date.now() < deadline) {
-        const summary = getConversationModelsFromDb(cid);
-        if (summary?.invocations?.[idxNum]) {
-          const snap = summary.invocations[idxNum];
-          if (bindKey) {
-            persistBadgeBinding(bindKey, { idx: idxNum, boundAt: Date.now(), snapshot: snap });
-          }
-          return snap;
-        }
-        await sleep(65);
-      }
-      const fallbackSummary = getConversationModelsFromDb(cid);
-      if (fallbackSummary?.invocations?.[idxNum]) {
-        const snap = fallbackSummary.invocations[idxNum];
-        if (bindKey) {
-          persistBadgeBinding(bindKey, { idx: idxNum, boundAt: Date.now(), snapshot: snap });
-        }
-        return snap;
-      }
-      const finalInflight = readInflightState(cid);
-      if (finalInflight?.configuredModelEnum) {
-        return resolveModelByEnum(finalInflight.configuredModelEnum);
-      }
-      return fallbackSummary?.latestModel || null;
-    })();
-    if (bindKey) {
-      pendingBadgePromises.set(bindKey, idxWork);
-      idxWork.finally(() => pendingBadgePromises.delete(bindKey));
-    }
-    return idxWork;
-  }
-
-  const work = (async () => {
-    const deadline = Date.now() + 5500;
-    let checkedColdOnce = false;
-
-    while (Date.now() < deadline) {
-      const inflight = readInflightState(cid);
-      const summary = getConversationModelsFromDb(cid);
-      const invCount = summary?.invocationCount || 0;
-      const hasRecentInflight = Boolean(inflight && (Date.now() - (inflight.updatedAtMs || 0) < 180000));
-
-      if (hasRecentInflight) {
-        const expectedMinCount = (inflight.preDbCount ?? 0) + 1;
-        if (invCount >= expectedMinCount || (inflight.inFlight === false && invCount > 0)) {
-          const snap = summary.latestModel;
-          if (bindKey && snap) {
-            persistBadgeBinding(bindKey, { idx: invCount - 1, boundAt: Date.now(), snapshot: snap });
-          }
-          return snap;
-        }
-      } else {
-        if (!checkedColdOnce) {
-          checkedColdOnce = true;
-          await sleep(160);
-          continue;
-        }
-        if (summary?.latestModel) {
-          const snap = summary.latestModel;
-          if (bindKey) {
-            persistBadgeBinding(bindKey, { idx: invCount - 1, boundAt: Date.now(), snapshot: snap });
-          }
-          return snap;
-        }
-        break;
-      }
-
-      await sleep(65);
-    }
-
-    // Timeout fallback (do not persist to badgeBindings so next load binds the real gen_metadata row)
-    const finalSummary = getConversationModelsFromDb(cid);
-    const finalInflight = readInflightState(cid);
-    if (finalSummary?.latestModel && (!finalInflight || finalSummary.invocationCount > (finalInflight.preDbCount ?? 0))) {
-      const snap = finalSummary.latestModel;
-      if (bindKey) {
-        persistBadgeBinding(bindKey, { idx: finalSummary.invocationCount - 1, boundAt: Date.now(), snapshot: snap });
-      }
-      return snap;
-    }
-
-    if (finalInflight?.configuredModelEnum) {
-      return resolveModelByEnum(finalInflight.configuredModelEnum);
-    }
-    return finalSummary?.latestModel || null;
-  })();
-
-  if (bindKey) {
-    pendingBadgePromises.set(bindKey, work);
-    work.finally(() => pendingBadgePromises.delete(bindKey));
-  }
-  return work;
-}
-
-function sendSvg(req, res, svg) {
-  const svgBuf = Buffer.from(svg, 'utf8');
-  res.writeHead(200, {
-    'Content-Type': 'image/svg+xml; charset=utf-8',
-    'Content-Length': String(svgBuf.length),
-    'Cache-Control': 'no-cache, max-age=0',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-    'Access-Control-Expose-Headers': 'Content-Length'
-  });
-  if (req.method === 'HEAD') {
-    res.end();
-  } else {
-    res.end(svgBuf);
-  }
 }
 
 function resolveTargetConversation(url, recent = null) {
@@ -373,31 +198,6 @@ async function handleRequest(req, res) {
     return;
   }
 
-  if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/api/badge.svg') {
-    const cid = (url.searchParams.get('cid') || url.searchParams.get('conversationId') || getActiveConversationId() || '').trim();
-    const k = (url.searchParams.get('k') || '').trim();
-    const explicitIdx = url.searchParams.get('idx');
-    const cfg = getPluginConfig();
-    const inv = await resolveBadgeInvocation(cid, k, explicitIdx);
-    const sessionSummary = cid ? getConversationModelsFromDb(cid) : null;
-    const svg = renderInlineBadgeSvg(inv, cfg, sessionSummary?.totals || null);
-    sendSvg(req, res, svg);
-    return;
-  }
-
-  if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/api/usage-badge.svg') {
-    const cid = (url.searchParams.get('cid') || url.searchParams.get('conversationId') || getActiveConversationId() || '').trim();
-    const sessionSummary = cid ? getConversationModelsFromDb(cid) : null;
-    const svg = renderUsageBadgeSvg(sessionSummary?.totals || null);
-    sendSvg(req, res, svg);
-    return;
-  }
-
-  if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/api/fork-badge.svg') {
-    sendSvg(req, res, renderForkBadgeSvg());
-    return;
-  }
-
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '/sidebar')) {
     res.writeHead(200, {
       'Content-Type': 'text/html; charset=utf-8',
@@ -487,12 +287,8 @@ async function handleRequest(req, res) {
   }
 
   if (url.pathname === '/api/set-config') {
-    const badgeMode = url.searchParams.get('badgeMode');
     const tpsMode = url.searchParams.get('tpsMode');
     const patch = {};
-    if (badgeMode && ['on_reply', 'every_step', 'off'].includes(badgeMode)) {
-      patch.badgeMode = badgeMode;
-    }
     if (tpsMode && ['decode', 'e2e'].includes(tpsMode)) {
       patch.tpsMode = tpsMode;
     }
@@ -534,7 +330,6 @@ async function handleRequest(req, res) {
       fleetUsage?.subagentCount || 0,
       fleetUsage?.team?.totalTokens || 0,
       cfg?.tpsMode || 'decode',
-      cfg?.badgeMode || 'on_reply',
       inflight?.inFlight ? 1 : 0
     ].join(':');
     sendJson(res, 200, {
@@ -705,7 +500,7 @@ if (port !== BADGE_PORT) {
       }
     });
     badgeServer.listen(BADGE_PORT, '127.0.0.1', () => {
-      console.log(`[agy-model-inspector] Live SVG Badge endpoint listening on http://127.0.0.1:${BADGE_PORT}`);
+      console.log(`[agy-model-inspector] Local runtime API listening on http://127.0.0.1:${BADGE_PORT}`);
     });
   };
   tryBindBadgePort();

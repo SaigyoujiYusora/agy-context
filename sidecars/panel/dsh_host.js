@@ -511,7 +511,6 @@
     modalOpenFallback: false,
     popover: null, // null | 'stats' | 'tokens'
     tpsSwitching: false,
-    badgeSaving: false,
     loading: true,
     error: null
   };
@@ -991,20 +990,6 @@
       await fetchBootstrap(appState.conversationId, false);
     } finally {
       appState.tpsSwitching = false;
-      notifyStore();
-    }
-  }
-
-  async function setBadgeMode(nextMode) {
-    if (appState.badgeSaving) return;
-    appState.badgeSaving = true;
-    notifyStore();
-    try {
-      await fetch(`/api/set-config?badgeMode=${encodeURIComponent(nextMode)}`);
-      appState.lastRevision = '';
-      await fetchBootstrap(appState.conversationId, false);
-    } finally {
-      appState.badgeSaving = false;
       notifyStore();
     }
   }
@@ -1597,11 +1582,10 @@
   function ComposerDock({ bootstrap }) {
     const sum = bootstrap?.summary;
     const head = bootstrap?.head;
-    const cfg = bootstrap?.config || { tpsMode: 'decode', badgeMode: 'on_reply' };
+    const cfg = bootstrap?.config || { tpsMode: 'decode' };
     const tot = sum?.totals || {};
     const lm = sum?.latestModel || null;
     const isE2e = cfg.tpsMode === 'e2e';
-    const badgeMode = cfg.badgeMode || 'on_reply';
 
     const sentModel = lm?.sentModel || lm?.actualModelLabel || 'N/A';
     const respModel = lm?.responseModel || 'N/A';
@@ -1791,22 +1775,6 @@
               )
             )
           ) : null
-        ),
-
-        // Reply SVG Badge Segmented Control
-        h('div', { className: 'agy-seg-group', title: '控制聊天回复气泡下方渲染的 SVG 徽章频率' },
-          h('span', { className: 'agy-seg-lbl' }, '对话徽章'),
-          [
-            ['on_reply', '回复末尾'],
-            ['every_step', '每步'],
-            ['off', '关闭']
-          ].map(([modeVal, modeLbl]) => h('button', {
-            key: modeVal,
-            type: 'button',
-            disabled: appState.badgeSaving,
-            className: `agy-seg-btn${badgeMode === modeVal ? ' is-on' : ''}`,
-            onClick: () => setBadgeMode(modeVal)
-          }, modeLbl))
         )
       )
     );
