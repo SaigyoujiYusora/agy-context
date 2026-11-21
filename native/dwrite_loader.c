@@ -5,19 +5,69 @@
  *    via PE export forwarding (resolved by ntdll before Chromium sandbox
  *    token lowering).
  * 2. In the Antigravity.exe main browser process only (never renderer/GPU or
- *    ELECTRON_RUN_AS_NODE child processes), installs a one-shot IAT redirect on
- *    Antigravity.exe's KERNEL32 file APIs so Electron's appSearchPaths skips
- *    resources\app.asar once and boots resources\app\index.cjs, which loads
- *    scripts/electron-overlay-loader.cjs and immediately delegates back to the
- *    untouched resources\app.asar.
+ *    ELECTRON_RUN_AS_NODE child processes):
+ *    - Checks that the AGY Context plugin script exists in %USERPROFILE%.
+ *    - Auto-recreates resources\app\{package.json,index.cjs} if an Antigravity
+ *      auto-update cleared resources\app (self-healing across updates).
+ *    - Installs a one-shot IAT redirect on Antigravity.exe's KERNEL32 file APIs
+ *      so Electron's appSearchPaths skips resources\app.asar once and boots
+ *      resources\app\index.cjs, which loads electron-overlay-loader.cjs and
+ *      immediately delegates back to the untouched resources\app.asar.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <wchar.h>
+#include <string.h>
 
 #pragma comment(linker, "/export:DWriteCreateFactory=C:\\Windows\\System32\\DWrite.DWriteCreateFactory,@1")
 
 static const char * const volatile AGY_CONTEXT_DLL_MARKER = "AGY_CONTEXT_DWRITE_LOADER_V1";
+
+static const char BOOTSTRAP_PKG_JSON[] =
+    "{\n"
+    "  \"name\": \"antigravity\",\n"
+    "  \"productName\": \"Antigravity\",\n"
+    "  \"main\": \"index.cjs\"\n"
+    "}\n";
+
+static const char BOOTSTRAP_INDEX_CJS[] =
+    "'use strict';\n"
+    "// AGY_CONTEXT_ELECTRON_LOADER - self-healing bootstrapper (app.asar left untouched)\n"
+    "\n"
+    "const fs = require('fs');\n"
+    "const os = require('os');\n"
+    "const path = require('path');\n"
+    "\n"
+    "const loaderPath = path.join(\n"
+    "  process.env.USERPROFILE || process.env.HOME || os.homedir(),\n"
+    "  '.gemini', 'config', 'plugins', 'agy-model-inspector', 'scripts', 'electron-overlay-loader.cjs'\n"
+    ");\n"
+    "try {\n"
+    "  if (fs.existsSync(loaderPath)) {\n"
+    "    require(loaderPath);\n"
+    "  }\n"
+    "} catch (err) {\n"
+    "  console.warn('[AGY Context] Direct Electron loader skipped:', err && err.message ? err.message : err);\n"
+    "}\n"
+    "\n"
+    "const asarPath = path.resolve(__dirname, '..', 'app.asar');\n"
+    "let realPkg = { main: 'dist/main.js' };\n"
+    "try {\n"
+    "  realPkg = JSON.parse(fs.readFileSync(path.join(asarPath, 'package.json'), 'utf8'));\n"
+    "} catch {}\n"
+    "\n"
+    "try {\n"
+    "  const electron = require('electron');\n"
+    "  if (electron && electron.app) {\n"
+    "    if (realPkg && realPkg.version) {\n"
+    "      electron.app.getVersion = () => realPkg.version;\n"
+    "    }\n"
+    "    electron.app.getAppPath = () => asarPath;\n"
+    "  }\n"
+    "} catch {}\n"
+    "\n"
+    "const mainRel = (realPkg && realPkg.main) ? realPkg.main : 'dist/main.js';\n"
+    "module.exports = require(path.join(asarPath, mainRel));\n";
 
 typedef HANDLE (WINAPI *PFN_CreateFileW)(
     LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
@@ -77,6 +127,45 @@ static int path_equals_ci(const wchar_t *a, const wchar_t *b) {
     a = strip_win32_prefix(a);
     b = strip_win32_prefix(b);
     return wcscmp_ascii_ci(a, b) == 0;
+}
+
+static int file_exists(const wchar_t *path) {
+    DWORD attr = GetFileAttributesW(path);
+    return (attr != INVALID_FILE_ATTRIBUTES) && ((attr & FILE_ATTRIBUTE_DIRECTORY) == 0);
+}
+
+static int write_ascii_file(const wchar_t *path, const char *content) {
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    DWORD total = (DWORD)strlen(content);
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, content, total, &written, NULL);
+    CloseHandle(h);
+    return ok && written == total;
+}
+
+static int ensure_bootstrap_files(const wchar_t *exeDir) {
+    wchar_t appDir[2048];
+    wchar_t pkgPath[2048];
+    if (wcslen(exeDir) + 64 >= 2048) return 0;
+
+    wcscpy_s(appDir, 2048, exeDir);
+    wcscat_s(appDir, 2048, L"\\resources\\app");
+    wcscpy_s(pkgPath, 2048, appDir);
+    wcscat_s(pkgPath, 2048, L"\\package.json");
+
+    if (file_exists(g_trigger_index) && file_exists(pkgPath)) {
+        return 1;
+    }
+
+    CreateDirectoryW(appDir, NULL);
+    if (!file_exists(pkgPath)) {
+        if (!write_ascii_file(pkgPath, BOOTSTRAP_PKG_JSON)) return 0;
+    }
+    if (!file_exists(g_trigger_index)) {
+        if (!write_ascii_file(g_trigger_index, BOOTSTRAP_INDEX_CJS)) return 0;
+    }
+    return file_exists(g_trigger_index) && file_exists(pkgPath);
 }
 
 static int should_hide_asar(LPCWSTR lpFileName) {
@@ -207,7 +296,7 @@ static void maybe_install_asar_bypass(void) {
     size_t dirLen = (size_t)(lastSep - exePath);
     if (dirLen + 64 >= 2048) return;
 
-    /* Check plugin overlay loader exists before enabling redirect. */
+    /* Check plugin overlay loader exists before enabling redirect or recreating resources\app. */
     wchar_t userProfile[1024];
     DWORD upLen = GetEnvironmentVariableW(L"USERPROFILE", userProfile, 1024);
     if (upLen == 0 || upLen >= 1024) return;
@@ -216,21 +305,21 @@ static void maybe_install_asar_bypass(void) {
     if (upLen + wcslen(pluginRel) + 1 >= 2048) return;
     wcscpy_s(pluginPath, 2048, userProfile);
     wcscat_s(pluginPath, 2048, pluginRel);
-    DWORD pAttr = GetFileAttributesW(pluginPath);
-    if (pAttr == INVALID_FILE_ATTRIBUTES || (pAttr & FILE_ATTRIBUTE_DIRECTORY)) return;
+    if (!file_exists(pluginPath)) return;
 
-    wcsncpy_s(g_target_asar, 2048, exePath, dirLen);
-    g_target_asar[dirLen] = L'\0';
+    wchar_t exeDir[2048];
+    wcsncpy_s(exeDir, 2048, exePath, dirLen);
+    exeDir[dirLen] = L'\0';
+
+    wcscpy_s(g_target_asar, 2048, exeDir);
     wcscat_s(g_target_asar, 2048, L"\\resources\\app.asar");
+    if (!file_exists(g_target_asar)) return;
 
-    wcsncpy_s(g_trigger_index, 2048, exePath, dirLen);
-    g_trigger_index[dirLen] = L'\0';
+    wcscpy_s(g_trigger_index, 2048, exeDir);
     wcscat_s(g_trigger_index, 2048, L"\\resources\\app\\index.cjs");
 
-    DWORD idxAttr = GetFileAttributesW(g_trigger_index);
-    if (idxAttr == INVALID_FILE_ATTRIBUTES || (idxAttr & FILE_ATTRIBUTE_DIRECTORY)) return;
-    DWORD asarAttr = GetFileAttributesW(g_target_asar);
-    if (asarAttr == INVALID_FILE_ATTRIBUTES || (asarAttr & FILE_ATTRIBUTE_DIRECTORY)) return;
+    /* Self-heal resources\app if an Antigravity auto-update wiped it. */
+    if (!ensure_bootstrap_files(exeDir)) return;
 
     HMODULE hExe = GetModuleHandleW(NULL);
     int hooked = 0;
