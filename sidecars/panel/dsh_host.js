@@ -69,7 +69,7 @@
     return out;
   }
 
-  function DualToken({ value, unit = '', inline = false }) {
+  function DualToken({ value, unit = '', inline = false, badge = null }) {
     const num = Math.max(0, Number(value || 0));
     const compact = fmtCompact(num) + (unit ? ' ' + unit : '');
     const exact = fmtInt(num) + (unit ? ' ' + unit : '');
@@ -80,7 +80,12 @@
       );
     }
     return h('div', { className: 'agy-dual-tok' },
-      h('div', { className: 'agy-dual-main' }, compact),
+      badge
+        ? h('div', { className: 'agy-dual-head' },
+            h('span', { className: 'agy-dual-main' }, compact),
+            badge
+          )
+        : h('div', { className: 'agy-dual-main' }, compact),
       h('div', { className: 'agy-dual-sub' }, exact)
     );
   }
@@ -1580,10 +1585,21 @@
                             ? h('span', { className: 'agy-tps-approx', title: inv.tpsApproxReason || '解码采样极短 (<0.6s) 或极高脉冲，可能不准' }, `~${tpsVal.toFixed(1)} tok/s · 可能不准`)
                             : h('span', { className: 'agy-tps-ok' }, `${tpsVal.toFixed(1)} tok/s`)
                         ),
-                        h('td', null,
-                          h(DualToken, { value: (inv.inputTokens || 0) + (inv.cacheReadTokens || 0), unit: 'in' }),
-                          h('div', { className: 'agy-sub-label mono' }, `miss ${fmtInt(inv.inputTokens)} · hit ${fmtInt(inv.cacheReadTokens)}`)
-                        ),
+                        (() => {
+                          const totalIn = (inv.inputTokens || 0) + (inv.cacheReadTokens || 0);
+                          const hitPct = totalIn > 0 ? ((inv.cacheReadTokens || 0) / totalIn) * 100 : null;
+                          const hitCls = hitPct === null ? '' : (hitPct >= 80 ? ' is-high' : hitPct >= 30 ? ' is-mid' : ' is-low');
+                          const hitBadge = hitPct !== null
+                            ? h('span', {
+                                className: `agy-cache-pct${hitCls}`,
+                                title: `本步缓存命中率 ${hitPct.toFixed(1)}% (${fmtInt(inv.cacheReadTokens)} / ${fmtInt(totalIn)})`
+                              }, `${hitPct.toFixed(1)}%`)
+                            : null;
+                          return h('td', null,
+                            h(DualToken, { value: totalIn, unit: 'in', badge: hitBadge }),
+                            h('div', { className: 'agy-sub-label mono' }, `miss ${fmtInt(inv.inputTokens)} · hit ${fmtInt(inv.cacheReadTokens)}`)
+                          );
+                        })(),
                         h('td', null,
                           h(DualToken, { value: inv.outputTokens || 0, unit: 'out' }),
                           h('div', { className: 'agy-sub-label mono' }, `正文 ${fmtInt(inv.bodyOutputTokens ?? inv.responseOutputTokens)} · 思考 ${fmtInt(inv.thinkingOutputTokens)}`)
