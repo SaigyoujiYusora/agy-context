@@ -92,7 +92,7 @@ function isConversationTarget(target) {
   }
 }
 
-const OVERLAY_VERSION = 'runtime-overlay-v37';
+const OVERLAY_VERSION = 'runtime-overlay-v38';
 let cachedOverlay = { mtimeMs: -1, source: '' };
 
 function getOverlayBundle() {

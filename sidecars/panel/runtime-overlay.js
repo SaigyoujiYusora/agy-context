@@ -8,8 +8,8 @@
 (function installAgyModelInspectorOverlay() {
   'use strict';
 
-  const VERSION = 'runtime-overlay-v37';
-  const BUILD = '20261121-quota-native-rpc-v1';
+  const VERSION = 'runtime-overlay-v38';
+  const BUILD = '20261121-icon-center-v1';
   function loopbackApiBase(value) {
     try {
       const parsed = new URL(String(value || 'http://127.0.0.1:18922'));
@@ -118,19 +118,27 @@
       outline: none;
     }
     .runtime-icon {
-      display: inline-grid;
-      place-items: center;
-      width: 13px;
-      height: 13px;
-      flex: 0 0 13px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 14px;
+      height: 14px;
+      flex: 0 0 14px;
       color: var(--muted-foreground, #a6a6a6);
       font-size: 13px;
       line-height: 1;
+    }
+    .runtime-icon > svg {
+      display: block;
+      width: 14px;
+      height: 14px;
+      flex: none;
     }
     .runtime-label {
       min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
+      line-height: 1;
     }
     .runtime-popover {
       position: fixed;
