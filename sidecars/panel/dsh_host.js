@@ -981,6 +981,9 @@
         return;
       }
       appState.bootstrap = data;
+      if (data?.updateStatus?.currentVersion) {
+        window.__AGY_PLUGIN_VERSION__ = data.updateStatus.currentVersion;
+      }
       appState.lastRevision = data.revision || '';
       if (!appState.conversationId && data.targetId) {
         appState.conversationId = data.targetId;
