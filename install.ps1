@@ -258,13 +258,17 @@ $items = @(
     'hooks.json',
     'README.md',
     'assets',
-    'rules',
     'scripts',
-    'sidecars',
-    'skills'
+    'sidecars'
 )
 
 New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+foreach ($legacyDir in @('rules', 'skills')) {
+    $legacyPath = Join-Path $targetDir $legacyDir
+    if (Test-Path -LiteralPath $legacyPath) {
+        Remove-Item -LiteralPath $legacyPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 foreach ($item in $items) {
     $srcPath = Join-Path $sourceDir $item
     if (-not (Test-Path -LiteralPath $srcPath)) {

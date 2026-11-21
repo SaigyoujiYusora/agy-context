@@ -3,10 +3,5 @@
   "displayName": "AGY Context",
   "version": "1.2.2",
   "description": "运行时注入 DSH 状态栏与模型统计；从宿主实际请求记录读取系统提示词与上下文。无需修改 app.asar。",
-  "logo": "assets/logo.svg",
-  "suggestedPrompts": [
-    "/model-info",
-    "查看当前会话真实返回的模型名称和 Token 统计",
-    "对比最近几个会话实际使用的后端模型"
-  ]
+  "logo": "assets/logo.svg"
 }

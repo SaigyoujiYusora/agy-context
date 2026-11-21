@@ -112,8 +112,7 @@ export function savePromptProfiles(value) {
 }
 
 export function syncPromptRules() {
-  const content = BASE;
-  if (!fs.existsSync(RULES) || fs.readFileSync(RULES, 'utf8') !== content) fs.writeFileSync(RULES, content, 'utf8');
+  // Legacy reply-badge rule (rules/AGENTS.md) has been removed for zero context-token overhead.
 }
 
 // Local rule files are inspectable, but are not evidence of the complete upstream system message.
