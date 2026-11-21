@@ -1189,10 +1189,15 @@ export function handleDshOverview(body = {}, currentCid = '') {
     let toolCalls = 0;
     const toolsTimingMap = {};
 
+    const seenSliceKeys = new Set();
     for (const s of sessions) {
       const matched = matchedSlicesByCid.get(s.conversationId) || [];
       if (matched.length > 0) {
         for (const sl of matched) {
+          if (sl.reqKey) {
+            if (seenSliceKeys.has(sl.reqKey)) continue;
+            seenSliceKeys.add(sl.reqKey);
+          }
           tokIn += sl.inTok || 0;
           tokCache += sl.cacheTok || 0;
           tokThink += sl.thinkTok || 0;

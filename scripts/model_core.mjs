@@ -1052,7 +1052,10 @@ export function lookupModelPricingRate(modelName, options = {}) {
     return { provider: 'anthropic', miss: 0.10, hit: 0.01, write: 0.125, out: 0.50, label: 'Claude Haiku 5.5', key: 'claude-haiku-5.5', confidence: 'high' };
   }
 
-  // 5. Gemini 4 family (check argon before orchestrator/carbon)
+  // 5. Gemini 4 family (check neon/argon before orchestrator/carbon)
+  if (m.includes('neon') || /\bm53[2345]\b/.test(m)) {
+    return { provider: 'google', miss: 3.0, hit: 0.15, write: 0, out: 15.0, label: 'Gemini 4 Neon', key: 'gemini-4-neon', confidence: 'high' };
+  }
   if (m.includes('argon') || /\bm41[78]\b/.test(m)) {
     if (ts >= GEMINI_4_PROMO_END_MS) {
       return { provider: 'google', miss: 4.0, hit: 0.20, write: 0, out: 20.0, label: 'Gemini 4 Argon', key: 'gemini-4-argon', confidence: 'high' };
@@ -2770,6 +2773,7 @@ export function getGlobalInsights(limit = 0) {
     ensureDayBucket(toLocalDayKey(ms), ms);
   }
 
+  const seenGlobalReqKeys = new Set();
   const sessions = recent.map((r) => {
     const t = r.totals || {};
     const lm = r.latestModel || {};
@@ -2787,6 +2791,14 @@ export function getGlobalInsights(limit = 0) {
     const invSlices = [];
     const ownActiveDays = new Set();
     let sessionCost = 0;
+    let uniqueReqs = 0;
+    let uniqueIn = 0;
+    let uniqueCache = 0;
+    let uniqueOut = 0;
+    let uniqueThink = 0;
+    let uniqueLlmMs = 0;
+    let uniqueCost = 0;
+    const hasInvs = Array.isArray(r.invocations) && r.invocations.length > 0;
     for (const inv of (r.invocations || [])) {
       const ts = inv.timestampMs || updatedMs;
       const dk = toLocalDayKey(ts);
@@ -2798,6 +2810,10 @@ export function getGlobalInsights(limit = 0) {
       const ttftMs = Math.round((inv.ttftSeconds || 0) * 1000);
       const genMs = Math.round((inv.streamingSeconds || 0) * 1000);
       const llmMs = Math.round(((inv.ttftSeconds || 0) + (inv.streamingSeconds || 0)) * 1000);
+      const reqKey = inv.requestId || inv.responseId || inv.messageId || '';
+      const isDup = Boolean(reqKey && seenGlobalReqKeys.has(reqKey));
+      if (reqKey && !isDup) seenGlobalReqKeys.add(reqKey);
+
       const invCost = estimateInvocationCost(
         inv.responseModel || inv.sentModel || inv.modelEnum || inv.modelDisplayName || '',
         inTok,
@@ -2807,13 +2823,23 @@ export function getGlobalInsights(limit = 0) {
       ).usd;
       sessionCost += invCost;
 
-      const dBucket = ensureDayBucket(dk, ts);
-      dBucket.requests += 1;
-      dBucket.inputTokens += inTok;
-      dBucket.cacheReadTokens += cacheTok;
-      dBucket.outputTokens += outTok;
-      dBucket.totalTokens += sliceTokens;
-      dBucket.costUsd += invCost;
+      if (!isDup) {
+        uniqueReqs += 1;
+        uniqueIn += inTok;
+        uniqueCache += cacheTok;
+        uniqueOut += outTok;
+        uniqueThink += thinkTok;
+        uniqueLlmMs += llmMs;
+        uniqueCost += invCost;
+
+        const dBucket = ensureDayBucket(dk, ts);
+        dBucket.requests += 1;
+        dBucket.inputTokens += inTok;
+        dBucket.cacheReadTokens += cacheTok;
+        dBucket.outputTokens += outTok;
+        dBucket.totalTokens += sliceTokens;
+        dBucket.costUsd += invCost;
+      }
 
       let rootSet = dayRootSessionSets.get(dk);
       if (!rootSet) {
@@ -2831,6 +2857,7 @@ export function getGlobalInsights(limit = 0) {
       teamDays.add(dk);
 
       invSlices.push({
+        reqKey,
         ts,
         dk,
         inTok,
@@ -2845,18 +2872,18 @@ export function getGlobalInsights(limit = 0) {
     }
 
     if (r.parentConversationId) subagentCount++;
-    totalRequests += r.invocationCount || 0;
-    totalInput += totIn;
-    totalCacheRead += totCache;
-    totalOutput += totOut;
-    totalThinking += totThink;
-    totalLlmMs += t.llmMs || 0;
-    totalCostUsd += sessionCost;
+    totalRequests += hasInvs ? uniqueReqs : (r.invocationCount || 0);
+    totalInput += hasInvs ? uniqueIn : totIn;
+    totalCacheRead += hasInvs ? uniqueCache : totCache;
+    totalOutput += hasInvs ? uniqueOut : totOut;
+    totalThinking += hasInvs ? uniqueThink : totThink;
+    totalLlmMs += hasInvs ? uniqueLlmMs : (t.llmMs || 0);
+    totalCostUsd += hasInvs ? uniqueCost : sessionCost;
 
     const mKey = lm.responseModel || lm.sentModel || 'unknown';
     const prevM = modelTokenMap.get(mKey) || { name: mKey, requests: 0, tokens: 0, sessions: 0 };
-    prevM.requests += r.invocationCount || 0;
-    prevM.tokens += totAll;
+    prevM.requests += hasInvs ? uniqueReqs : (r.invocationCount || 0);
+    prevM.tokens += hasInvs ? (uniqueIn + uniqueCache + uniqueOut) : totAll;
     prevM.sessions++;
     modelTokenMap.set(mKey, prevM);
 
