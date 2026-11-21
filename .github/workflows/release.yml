@@ -1,0 +1,204 @@
+name: Build & Publish Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (leave empty to use v<plugin.json version>)'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark as prerelease'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build Windows x64 DLL & Package Release
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate version
+        id: meta
+        run: |
+          $manifest = Get-Content -LiteralPath 'plugin.json' -Raw -Encoding UTF8 | ConvertFrom-Json
+          $pkgVersion = [string]$manifest.version
+          if ([string]::IsNullOrWhiteSpace($pkgVersion)) {
+            throw 'plugin.json is missing a version field.'
+          }
+
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tag = $env:GITHUB_REF_NAME
+            $expected = "v$pkgVersion"
+            if ($tag -ne $expected) {
+              throw "Tag '$tag' does not match plugin.json version '$pkgVersion' (expected '$expected')."
+            }
+          } else {
+            $inputTag = '${{ inputs.tag }}'
+            $tag = if ([string]::IsNullOrWhiteSpace($inputTag)) { "v$pkgVersion" } else { $inputTag.Trim() }
+          }
+
+          $isPre = if ('${{ inputs.prerelease }}' -eq 'true' -or $tag -match '-') { 'true' } else { 'false' }
+
+          "version=$pkgVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "prerelease=$isPre" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Resolved release: tag=$tag version=$pkgVersion prerelease=$isPre"
+
+      - name: Verify JavaScript syntax
+        run: |
+          $files = @(
+            Get-ChildItem -LiteralPath 'scripts' -Recurse -File | Where-Object { $_.Extension -in '.mjs', '.js', '.cjs' }
+            Get-ChildItem -LiteralPath 'sidecars/panel' -File | Where-Object { $_.Extension -in '.mjs', '.js', '.cjs' }
+            Get-Item -LiteralPath 'sidecars/panel/vendor/dsh-context-client.js'
+          )
+          foreach ($f in $files) {
+            node --check $f.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "Syntax check failed: $($f.FullName)"
+            }
+          }
+          Write-Host "Syntax check passed for $($files.Count) JS/MJS/CJS files."
+
+      - name: Build DWrite.dll (x64) from source
+        run: |
+          $dllPath = Join-Path $PWD 'native\DWrite.dll'
+          if (Test-Path -LiteralPath $dllPath) {
+            Remove-Item -LiteralPath $dllPath -Force
+          }
+          & (Join-Path $PWD 'native\build-dll.ps1')
+          if (-not (Test-Path -LiteralPath $dllPath)) {
+            throw "Expected built DLL at $dllPath"
+          }
+
+          # Verify AGY Context DLL marker bytes
+          $bytes = [System.IO.File]::ReadAllBytes($dllPath)
+          $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if (-not $ascii.Contains('AGY_CONTEXT_DWRITE_LOADER_V1')) {
+            throw 'Built DWrite.dll is missing AGY_CONTEXT_DWRITE_LOADER_V1 marker.'
+          }
+          Write-Host "Verified freshly built DWrite.dll ($($bytes.Length) bytes)."
+
+      - name: Stage and package release archive
+        id: pkg
+        run: |
+          $tag = '${{ steps.meta.outputs.tag }}'
+          $distDir = Join-Path $PWD 'dist'
+          $stageRoot = Join-Path $distDir "agy-context-$tag"
+          $zipName = "agy-context-$tag-windows-x64.zip"
+          $zipPath = Join-Path $distDir $zipName
+
+          if (Test-Path -LiteralPath $distDir) {
+            Remove-Item -LiteralPath $distDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+
+          $items = @(
+            'install.ps1',
+            'plugin.json',
+            'hooks.json',
+            'README.md',
+            'LICENSE',
+            'assets',
+            'scripts',
+            'sidecars',
+            'native'
+          )
+          foreach ($item in $items) {
+            $src = Join-Path $PWD $item
+            if (-not (Test-Path -LiteralPath $src)) {
+              throw "Missing release item: $item"
+            }
+            Copy-Item -LiteralPath $src -Destination (Join-Path $stageRoot $item) -Recurse -Force
+          }
+
+          # Keep archive root clean so users can unzip and run .\install.ps1 directly
+          Compress-Archive -Path (Join-Path $stageRoot '*') -DestinationPath $zipPath -CompressionLevel Optimal -Force
+
+          $standaloneDll = Join-Path $distDir 'DWrite.dll'
+          Copy-Item -LiteralPath (Join-Path $PWD 'native\DWrite.dll') -Destination $standaloneDll -Force
+
+          $sumPath = Join-Path $distDir 'SHA256SUMS.txt'
+          $sumLines = foreach ($artifact in @($zipPath, $standaloneDll)) {
+            $hash = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $(Split-Path -Leaf $artifact)"
+          }
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::WriteAllText($sumPath, (($sumLines -join "`n") + "`n"), $utf8NoBom)
+
+          Write-Host "Packaged artifacts:"
+          Get-ChildItem -LiteralPath $distDir -File | Format-Table Name, Length -AutoSize
+          Get-Content -LiteralPath $sumPath
+          "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ steps.meta.outputs.tag }}'
+          $zipName = '${{ steps.pkg.outputs.zip_name }}'
+          $isPre = '${{ steps.meta.outputs.prerelease }}' -eq 'true'
+          $assets = @(
+            (Join-Path $PWD "dist\$zipName"),
+            (Join-Path $PWD 'dist\DWrite.dll'),
+            (Join-Path $PWD 'dist\SHA256SUMS.txt')
+          )
+
+          $notesLines = @(
+            '## Installation (Windows x64)',
+            '',
+            "1. Download ``$zipName`` and extract it to any folder.",
+            '2. Open **PowerShell 7 (`pwsh`)** in the extracted folder and run:',
+            '   ```powershell',
+            '   pwsh .\install.ps1',
+            '   ```',
+            '3. Quit Antigravity completely (system tray -> Quit) and reopen it once to activate the prebuilt `DWrite.dll` direct overlay loader.',
+            '',
+            '> `DWrite.dll` in this release is built cleanly from `native/dwrite_loader.c` on GitHub Actions (`windows-latest` MSVC x64). Verify integrity via `SHA256SUMS.txt`.'
+          )
+          $notesHeader = $notesLines -join "`n"
+
+          $autoNotes = ''
+          try {
+            $genOut = gh api "repos/$env:GITHUB_REPOSITORY/releases/generate-notes" -f "tag_name=$tag" --jq '.body' 2>$null
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($genOut)) {
+              $autoNotes = "`n`n" + ($genOut -join "`n").Trim()
+            }
+          } catch {}
+
+          $notesFile = Join-Path $PWD 'dist\release-notes.md'
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::WriteAllText($notesFile, ($notesHeader + $autoNotes + "`n"), $utf8NoBom)
+
+          $exists = $false
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { $exists = $true }
+
+          if ($exists) {
+            Write-Host "Release $tag already exists; uploading/replacing assets..."
+            gh release upload $tag @assets --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed for $tag" }
+          } else {
+            $args = @('release', 'create', $tag) + $assets + @(
+              '--title', "AGY Context $tag",
+              '--notes-file', $notesFile
+            )
+            if ($isPre) { $args += '--prerelease' }
+            & gh @args
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed for $tag" }
+          }
