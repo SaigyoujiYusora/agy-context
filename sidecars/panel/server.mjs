@@ -6,6 +6,12 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { getPromptProfiles, savePromptProfiles, getPromptSources, getNativePromptState, readNativePromptCapture } from '../../scripts/prompt_profiles.mjs';
 import {
+  recordQuotaSample,
+  getQuotaAnalytics,
+  fetchQuotaFromLanguageServer,
+  startQuotaAutoRefreshScheduler
+} from '../../scripts/quota_estimator.mjs';
+import {
   PLUGIN_DATA_DIR,
   BADGE_PORT,
   getConversationModelsFromDb,
@@ -105,14 +111,80 @@ function resolveTargetConversation(url, recent = null) {
 async function handleRequest(req, res) {
   const url = new URL(req.url || '/', `http://127.0.0.1:${port}`);
 
-  if (['/api/prompt-profiles', '/api/prompt-sources', '/api/runtime-state', '/api/native-prompts', '/api/fork-turn'].includes(url.pathname)) {
+  if (['/api/prompt-profiles', '/api/prompt-sources', '/api/runtime-state', '/api/native-prompts', '/api/fork-turn', '/api/quota-sample', '/api/quota-stats', '/api/quota-refresh'].includes(url.pathname)) {
     const origin = req.headers.origin;
     const host = req.headers.host || '';
     const pluginOrigin = /^plugin:\/\/agy-model-inspector--panel-(\d+)$/.exec(origin || '');
     const samePlugin = Boolean(pluginOrigin && Number(pluginOrigin[1]) === Number(host.split(':').at(-1)));
-    if (!/^(127\.0\.0\.1|localhost):\d+$/.test(host) || (!samePlugin && (req.headers['sec-fetch-site'] === 'cross-site' ||
+    const isLoopbackOrigin = Boolean(origin && /^https?:\/\/(127\.0\.0\.1|localhost):\d+$/.test(origin));
+    const allowQuotaLoopback = (url.pathname === '/api/quota-sample' || url.pathname === '/api/quota-refresh') && isLoopbackOrigin;
+    if (!/^(127\.0\.0\.1|localhost):\d+$/.test(host) || (!samePlugin && !allowQuotaLoopback && (req.headers['sec-fetch-site'] === 'cross-site' ||
         (origin && origin !== `http://${host}`)))) {
       res.writeHead(403); res.end('Forbidden origin'); return;
+    }
+    if (url.pathname === '/api/quota-refresh') {
+      if (req.method === 'OPTIONS') {
+        const headers = {
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'content-type',
+          'Access-Control-Allow-Private-Network': 'true',
+          'Access-Control-Max-Age': '600'
+        };
+        if (allowQuotaLoopback) headers['Access-Control-Allow-Origin'] = origin;
+        res.writeHead(204, headers);
+        res.end();
+        return;
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Cache-Control', 'no-store');
+      if (allowQuotaLoopback) res.setHeader('Access-Control-Allow-Origin', origin);
+      if (req.method !== 'POST') {
+        res.writeHead(405); res.end(JSON.stringify({ error: 'POST required' })); return;
+      }
+      try {
+        const fetched = await fetchQuotaFromLanguageServer({ force: true, source: 'manual_rpc' });
+        res.end(JSON.stringify({ ok: Boolean(fetched?.ok), fetched, quota: getQuotaAnalytics({ force: true }) }));
+      } catch (err) {
+        res.writeHead(500); res.end(JSON.stringify({ ok: false, error: String(err?.message || err), quota: getQuotaAnalytics() }));
+      }
+      return;
+    }
+    if (url.pathname === '/api/quota-sample') {
+      if (req.method === 'OPTIONS') {
+        const headers = {
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'content-type',
+          'Access-Control-Allow-Private-Network': 'true',
+          'Access-Control-Max-Age': '600'
+        };
+        if (allowQuotaLoopback) headers['Access-Control-Allow-Origin'] = origin;
+        res.writeHead(204, headers);
+        res.end();
+        return;
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Cache-Control', 'no-store');
+      if (allowQuotaLoopback) res.setHeader('Access-Control-Allow-Origin', origin);
+      if (req.method !== 'POST' || !String(req.headers['content-type']).startsWith('application/json')) {
+        res.writeHead(405); res.end(JSON.stringify({ error: 'POST JSON required' })); return;
+      }
+      try {
+        const result = recordQuotaSample(await readJsonBody(req));
+        res.end(JSON.stringify({ ...result, quota: getQuotaAnalytics() }));
+      } catch (err) {
+        res.writeHead(400); res.end(JSON.stringify({ error: String(err?.message || err) }));
+      }
+      return;
+    }
+    if (url.pathname === '/api/quota-stats') {
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Cache-Control', 'no-store');
+      try {
+        res.end(JSON.stringify({ ok: true, quota: getQuotaAnalytics() }));
+      } catch (err) {
+        res.writeHead(500); res.end(JSON.stringify({ error: String(err?.message || err) }));
+      }
+      return;
     }
     if (url.pathname === '/api/fork-turn') {
       res.setHeader('Content-Type', 'application/json');
@@ -160,6 +232,10 @@ async function handleRequest(req, res) {
     if (url.pathname === '/api/prompt-sources') { res.end(JSON.stringify(getPromptSources(cid))); return; }
     const summary = cid ? getConversationModelsFromDb(cid) : null;
     const analytics = cid ? getSessionTranscriptAnalytics(cid, summary, { includeBrowser: false }) : null;
+    const quota = getQuotaAnalytics();
+    const cfg = getPluginConfig();
+    const qb = cfg?.quotaBar || {};
+    const qbSig = `${qb.enabled !== false ? 1 : 0}${qb.gemini5h ? 1 : 0}${qb.geminiWeekly ? 1 : 0}${qb.claude5h ? 1 : 0}${qb.claudeWeekly ? 1 : 0}`;
     const revision = [
       cid,
       summary?.invocationCount || 0,
@@ -170,7 +246,9 @@ async function handleRequest(req, res) {
       analytics?.sessionStats?.subagentCount || 0,
       analytics?.sessionStats?.teamTotalTokens || 0,
       analytics?.composition?.totalTokens || 0,
-      Math.round(((analytics?.sessionStats?.teamEstimatedCostUsd ?? analytics?.sessionStats?.estimatedCostUsd) || 0) * 10000)
+      Math.round(((analytics?.sessionStats?.teamEstimatedCostUsd ?? analytics?.sessionStats?.estimatedCostUsd) || 0) * 10000),
+      quota?.revision || 'q:0',
+      qbSig
     ].join(':');
     const sinceRevision = (url.searchParams.get('sinceRevision') || '').trim();
     if (sinceRevision && sinceRevision === revision) {
@@ -178,7 +256,7 @@ async function handleRequest(req, res) {
       return;
     }
     const lightSummary = summary ? { ...summary, invocations: undefined } : null;
-    res.end(JSON.stringify({ ok: true, conversationId: cid, revision, summary: lightSummary, analytics, invocations: summary?.invocations || [] }));
+    res.end(JSON.stringify({ ok: true, conversationId: cid, revision, summary: lightSummary, analytics, quota, quotaBar: qb, invocations: summary?.invocations || [] }));
     return;
   }
 
@@ -287,10 +365,14 @@ async function handleRequest(req, res) {
   }
 
   if (url.pathname === '/api/set-config') {
-    const tpsMode = url.searchParams.get('tpsMode');
+    const body = req.method === 'POST' ? await readJsonBody(req) : {};
+    const tpsMode = url.searchParams.get('tpsMode') || body?.tpsMode;
     const patch = {};
     if (tpsMode && ['decode', 'e2e'].includes(tpsMode)) {
       patch.tpsMode = tpsMode;
+    }
+    if (body?.quotaBar && typeof body.quotaBar === 'object') {
+      patch.quotaBar = body.quotaBar;
     }
     if (Object.keys(patch).length > 0) {
       const updated = savePluginConfig(patch);
@@ -453,6 +535,7 @@ server.on('error', (err) => {
 
 server.listen(port, '127.0.0.1', () => {
   console.log(`[agy-model-inspector] Sidecar UI listening on http://127.0.0.1:${port}`);
+  startQuotaAutoRefreshScheduler();
   if (process.env.AGY_DISABLE_RUNTIME_INJECTOR !== '1') {
     const child = spawn(process.execPath, ['--no-warnings', path.resolve(__dirname, '../../scripts/runtime-injector.mjs')], {
       detached: true, windowsHide: true, stdio: 'ignore', env: process.env

@@ -180,11 +180,22 @@
   async function syncOverlay(wc, payload, overlayVersion) {
     const versionLiteral = JSON.stringify(overlayVersion);
     const body = payload?.unchanged
-      ? `const tickRes=typeof overlay.tick==='function'?overlay.tick(${JSON.stringify(payload.revision || '')}):{needUpdate:true};return{needInject:false,needUpdate:Boolean(tickRes?.needUpdate),forkRequests:typeof overlay.drainForkRequests==='function'?overlay.drainForkRequests():[]};`
-      : `overlay.update(${JSON.stringify(payload)});return{needInject:false,needUpdate:false,forkRequests:typeof overlay.drainForkRequests==='function'?overlay.drainForkRequests():[]};`;
-    const expression = `(()=>{const overlay=globalThis.__AGY_MODEL_INSPECTOR_OVERLAY__;if(!overlay||overlay.version!==${versionLiteral})return{needInject:true,needUpdate:false,forkRequests:[]};${body}})()`;
+      ? `const tickRes=typeof overlay.tick==='function'?overlay.tick(${JSON.stringify(payload.revision || '')}):{needUpdate:true};return{needInject:false,needUpdate:Boolean(tickRes?.needUpdate),forkRequests:typeof overlay.drainForkRequests==='function'?overlay.drainForkRequests():[],quotaSamples:typeof overlay.drainQuotaSamples==='function'?overlay.drainQuotaSamples():[]};`
+      : `overlay.update(${JSON.stringify(payload)});return{needInject:false,needUpdate:false,forkRequests:typeof overlay.drainForkRequests==='function'?overlay.drainForkRequests():[],quotaSamples:typeof overlay.drainQuotaSamples==='function'?overlay.drainQuotaSamples():[]};`;
+    const expression = `(()=>{const overlay=globalThis.__AGY_MODEL_INSPECTOR_OVERLAY__;if(!overlay||overlay.version!==${versionLiteral})return{needInject:true,needUpdate:false,forkRequests:[],quotaSamples:[]};${body}})()`;
     const value = await execInMainFrame(wc, expression);
-    return value && typeof value === 'object' ? value : { needInject: true, needUpdate: false, forkRequests: [] };
+    return value && typeof value === 'object' ? value : { needInject: true, needUpdate: false, forkRequests: [], quotaSamples: [] };
+  }
+
+  async function submitQuotaSamples(samples) {
+    let storedAny = false;
+    for (const sample of (samples || []).slice(0, 3)) {
+      try {
+        const res = await localApiRequest('POST', '/api/quota-sample', sample, 4000);
+        if (res.status >= 200 && res.status < 300 && res.json?.stored) storedAny = true;
+      } catch {}
+    }
+    return storedAny;
   }
 
   async function resolveForkRequests(wc, conversationId, forkRequests) {
@@ -270,6 +281,16 @@
           state.lastRevision = String(payload.revision);
         } else if (payload && !payload.unchanged) {
           state.lastRevision = '';
+        }
+        if (sync?.quotaSamples?.length) {
+          const stored = await submitQuotaSamples(sync.quotaSamples);
+          if (stored) {
+            payload = await readRuntimeState(cid, '');
+            if (payload) {
+              await syncOverlay(wc, payload, bundle.version);
+              if (payload.revision) state.lastRevision = String(payload.revision);
+            }
+          }
         }
         if (sync?.forkRequests?.length) {
           await resolveForkRequests(wc, cid, sync.forkRequests);

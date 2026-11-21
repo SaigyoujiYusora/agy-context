@@ -92,7 +92,7 @@ function isConversationTarget(target) {
   }
 }
 
-const OVERLAY_VERSION = 'runtime-overlay-v22';
+const OVERLAY_VERSION = 'runtime-overlay-v37';
 let cachedOverlay = { mtimeMs: -1, source: '' };
 
 function getOverlayBundle() {
@@ -191,15 +191,32 @@ async function readRuntimeState(target, sinceRevision = '') {
 async function syncTargetOverlay(target, payload) {
   const versionLiteral = JSON.stringify(OVERLAY_VERSION);
   const body = payload?.unchanged
-    ? `const tickRes=typeof overlay.tick==='function'?overlay.tick(${JSON.stringify(payload.revision || '')}):{needUpdate:true};return{needInject:false,needUpdate:Boolean(tickRes?.needUpdate),forkRequests:typeof overlay.drainForkRequests==='function'?overlay.drainForkRequests():[]};`
-    : `overlay.update(${JSON.stringify(payload)});return{needInject:false,needUpdate:false,forkRequests:typeof overlay.drainForkRequests==='function'?overlay.drainForkRequests():[]};`;
-  const expression = `(()=>{const overlay=globalThis.__AGY_MODEL_INSPECTOR_OVERLAY__;if(!overlay||overlay.version!==${versionLiteral})return{needInject:true,needUpdate:false,forkRequests:[]};${body}})()`;
+    ? `const tickRes=typeof overlay.tick==='function'?overlay.tick(${JSON.stringify(payload.revision || '')}):{needUpdate:true};return{needInject:false,needUpdate:Boolean(tickRes?.needUpdate),forkRequests:typeof overlay.drainForkRequests==='function'?overlay.drainForkRequests():[],quotaSamples:typeof overlay.drainQuotaSamples==='function'?overlay.drainQuotaSamples():[]};`
+    : `overlay.update(${JSON.stringify(payload)});return{needInject:false,needUpdate:false,forkRequests:typeof overlay.drainForkRequests==='function'?overlay.drainForkRequests():[],quotaSamples:typeof overlay.drainQuotaSamples==='function'?overlay.drainQuotaSamples():[]};`;
+  const expression = `(()=>{const overlay=globalThis.__AGY_MODEL_INSPECTOR_OVERLAY__;if(!overlay||overlay.version!==${versionLiteral})return{needInject:true,needUpdate:false,forkRequests:[],quotaSamples:[]};${body}})()`;
   const result = await cdpCall(target.webSocketDebuggerUrl, 'Runtime.evaluate', {
     expression,
     awaitPromise: true,
     returnByValue: true
   });
-  return result.result?.value || { needInject: true, needUpdate: false, forkRequests: [] };
+  return result.result?.value || { needInject: true, needUpdate: false, forkRequests: [], quotaSamples: [] };
+}
+
+async function submitQuotaSamples(samples) {
+  let storedAny = false;
+  for (const sample of (samples || []).slice(0, 3)) {
+    try {
+      const response = await fetch(`${API_BASE}/api/quota-sample`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sample),
+        signal: AbortSignal.timeout(4000)
+      });
+      const data = await response.json();
+      if (response.ok && data?.stored) storedAny = true;
+    } catch {}
+  }
+  return storedAny;
 }
 
 async function resolveForkRequests(target, forkRequests) {
@@ -259,6 +276,16 @@ async function scanOnce() {
         known.lastRevision = String(payload.revision);
       } else if (payload && !payload.unchanged) {
         known.lastRevision = '';
+      }
+      if (sync?.quotaSamples?.length) {
+        const stored = await submitQuotaSamples(sync.quotaSamples);
+        if (stored) {
+          payload = await readRuntimeState(target, '');
+          if (payload) {
+            await syncTargetOverlay(target, payload);
+            if (payload.revision) known.lastRevision = String(payload.revision);
+          }
+        }
       }
       if (sync?.forkRequests?.length) {
         await resolveForkRequests(target, sync.forkRequests);

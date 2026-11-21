@@ -509,8 +509,9 @@
     activeTab: 'context',
     theme: initialTheme,
     modalOpenFallback: false,
-    popover: null, // null | 'stats' | 'tokens'
+    popover: null, // null | 'stats' | 'tokens' | 'quota'
     tpsSwitching: false,
+    quotaRefreshing: false,
     loading: true,
     error: null
   };
@@ -992,6 +993,63 @@
       appState.tpsSwitching = false;
       notifyStore();
     }
+  }
+
+  async function triggerQuotaRefresh() {
+    if (appState.quotaRefreshing) return;
+    appState.quotaRefreshing = true;
+    notifyStore();
+    try {
+      const res = await fetch('/api/quota-refresh', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.quota && appState.bootstrap) {
+          appState.bootstrap = { ...appState.bootstrap, quota: data.quota };
+          notifyStore();
+        }
+      }
+      appState.lastRevision = '';
+      await fetchBootstrap(appState.conversationId, false);
+    } catch {} finally {
+      appState.quotaRefreshing = false;
+      notifyStore();
+    }
+  }
+
+
+  async function updateQuotaBarConfig(patch) {
+    const prevCfg = appState.bootstrap?.config || {};
+    const prevQb = {
+      enabled: true,
+      gemini5h: true,
+      geminiWeekly: false,
+      claude5h: false,
+      claudeWeekly: false,
+      ...(prevCfg.quotaBar || {})
+    };
+    const nextQb = { ...prevQb, ...patch };
+    if (appState.bootstrap) {
+      appState.bootstrap = {
+        ...appState.bootstrap,
+        config: { ...prevCfg, quotaBar: nextQb }
+      };
+      notifyStore();
+    }
+    try {
+      const res = await fetch('/api/set-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quotaBar: nextQb })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.config && appState.bootstrap) {
+          appState.bootstrap = { ...appState.bootstrap, config: data.config };
+          notifyStore();
+        }
+      }
+      appState.lastRevision = '';
+    } catch {}
   }
 
   function toggleTheme() {
@@ -1586,6 +1644,7 @@
     const tot = sum?.totals || {};
     const lm = sum?.latestModel || null;
     const isE2e = cfg.tpsMode === 'e2e';
+    const quota = bootstrap?.quota || null;
 
     const sentModel = lm?.sentModel || lm?.actualModelLabel || 'N/A';
     const respModel = lm?.responseModel || 'N/A';
@@ -1775,7 +1834,238 @@
               )
             )
           ) : null
-        )
+        ),
+
+        // Pill 3: 5h / Weekly Quota Estimator + Upward Popover
+        (() => {
+          const fmtShortUsd = (v) => {
+            const n = Number(v || 0);
+            if (!(n > 0)) return '$0';
+            if (n >= 100) return `$${Math.round(n)}`;
+            if (n >= 10) return `$${n.toFixed(1)}`;
+            return `$${n.toFixed(2)}`;
+          };
+          const fmtCountdown = (ms) => {
+            const totalMin = Math.max(0, Math.round(Number(ms || 0) / 60000));
+            if (totalMin < 1) return '即将重置';
+            const d = Math.floor(totalMin / 1440);
+            const h2 = Math.floor((totalMin % 1440) / 60);
+            const m = totalMin % 60;
+            if (d > 0) return h2 > 0 ? `${d}d ${h2}h 后重置` : `${d}d 后重置`;
+            if (h2 > 0) return m > 0 ? `${h2}h ${m}m 后重置` : `${h2}h 后重置`;
+            return `${m}m 后重置`;
+          };
+          const fmtAgo = (ms) => {
+            const sec = Math.max(0, Math.round((Date.now() - Number(ms || 0)) / 1000));
+            if (sec < 60) return '刚刚更新';
+            const min = Math.floor(sec / 60);
+            if (min < 60) return `${min}分钟前更新`;
+            const hr = Math.floor(min / 60);
+            if (hr < 24) return `${hr}小时前更新`;
+            return `${Math.floor(hr / 24)}天前更新`;
+          };
+          const modelProbe = [lm?.sentModel, lm?.responseModel, lm?.modelDisplayName, lm?.apiProvider].filter(Boolean).join(' ').toLowerCase();
+          const activePoolKey = /claude|anthropic|gpt|openai/.test(modelProbe) ? 'claude_gpt' : 'gemini';
+          const otherPoolKey = activePoolKey === 'gemini' ? 'claude_gpt' : 'gemini';
+          const activePool = quota?.pools?.[activePoolKey] || quota?.pools?.gemini || null;
+          const otherPool = quota?.pools?.[otherPoolKey] || null;
+          const qb = {
+            enabled: cfg?.quotaBar?.enabled !== false,
+            gemini5h: cfg?.quotaBar?.gemini5h !== undefined ? Boolean(cfg.quotaBar.gemini5h) : true,
+            geminiWeekly: Boolean(cfg?.quotaBar?.geminiWeekly),
+            claude5h: Boolean(cfg?.quotaBar?.claude5h),
+            claudeWeekly: Boolean(cfg?.quotaBar?.claudeWeekly)
+          };
+
+          const formatPillText = () => {
+            if (!quota?.hasSamples) return appState.quotaRefreshing ? '刷新中…' : '额度推算';
+            const gPool = quota?.pools?.gemini;
+            const cPool = quota?.pools?.claude_gpt;
+            const fmtLeft = (win, expiredText = '重置') => {
+              if (!win?.sampled) return '--';
+              if (win.expired) return expiredText;
+              const v = Number(win.latest?.leftPct ?? 100);
+              if (v >= 99.95) return '100%';
+              return win.latest?.exactFraction ? `${v.toFixed(1)}%` : `${Math.round(v)}%`;
+            };
+            const pctStr = (win) => fmtLeft(win, '重置');
+            const singleWinStr = (prefix, tag, win) => {
+              if (!win?.sampled) return `${prefix}${tag} --`;
+              const left = fmtLeft(win, '已重置');
+              const usd = win.estimate?.status === 'estimated' ? ` · ~${fmtShortUsd(win.estimate.estTotalUsd)}` : '';
+              return `${prefix}${tag} ${left}${usd}`;
+            };
+            const gSel = [qb.gemini5h ? '5h' : '', qb.geminiWeekly ? 'wk' : ''].filter(Boolean);
+            const cSel = [qb.claude5h ? '5h' : '', qb.claudeWeekly ? 'wk' : ''].filter(Boolean);
+            const totalSel = gSel.length + cSel.length;
+            if (totalSel === 0) {
+              const pool = quota?.pools?.[activePoolKey] || gPool;
+              return singleWinStr(activePoolKey === 'claude_gpt' ? 'C/G ' : '', '5h', pool?.fiveHour);
+            }
+            if (totalSel === 1) {
+              if (qb.gemini5h) return singleWinStr('', '5h', gPool?.fiveHour);
+              if (qb.geminiWeekly) return singleWinStr('', '周', gPool?.weekly);
+              if (qb.claude5h) return singleWinStr('C/G ', '5h', cPool?.fiveHour);
+              return singleWinStr('C/G ', '周', cPool?.weekly);
+            }
+            if (gSel.length === 2 && cSel.length === 0) {
+              return `5h ${pctStr(gPool?.fiveHour)} · 周 ${pctStr(gPool?.weekly)}`;
+            }
+            if (cSel.length === 2 && gSel.length === 0) {
+              return `C/G 5h ${pctStr(cPool?.fiveHour)} · 周 ${pctStr(cPool?.weekly)}`;
+            }
+            const fmtPoolCompact = (tag, pool, has5h, hasWk) => {
+              if (has5h && hasWk) return `${tag} ${pctStr(pool?.fiveHour)}/${pctStr(pool?.weekly)}`;
+              if (has5h) return `${tag} 5h ${pctStr(pool?.fiveHour)}`;
+              return `${tag} 周 ${pctStr(pool?.weekly)}`;
+            };
+            const parts = [];
+            if (gSel.length) parts.push(fmtPoolCompact('G', gPool, qb.gemini5h, qb.geminiWeekly));
+            if (cSel.length) parts.push(fmtPoolCompact('C/G', cPool, qb.claude5h, qb.claudeWeekly));
+            return parts.join(' · ');
+          };
+          const pillText = formatPillText();
+
+          const clockSvg = h('svg', { width: 13, height: 13, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.35, 'aria-hidden': 'true' },
+            h('circle', { cx: 8, cy: 8, r: 6 }),
+            h('path', { d: 'M8 4.4V8L10.6 9.6', strokeLinecap: 'round', strokeLinejoin: 'round' })
+          );
+          const refreshSvg = h('svg', { width: 13, height: 13, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true' },
+            h('path', { d: 'M13.5 8a5.5 5.5 0 1 1-1.45-3.73' }),
+            h('path', { d: 'M13.5 2.5v2.75h-2.75' })
+          );
+
+          const renderWindow = (title, win) => {
+            if (!win || !win.sampled) {
+              return h('div', { className: 'agy-quota-row' }, h('span', null, title), h('strong', null, '未采样'));
+            }
+            const leftPct = win.expired ? 100 : Number(win.latest?.leftPct ?? 100);
+            const leftPctLabel = leftPct >= 99.95 ? '100%' : (win.latest?.exactFraction ? `${leftPct.toFixed(1)}%` : `${Math.round(leftPct)}%`);
+            const barClass = leftPct <= 15 ? 'is-crit' : leftPct <= 40 ? 'is-warn' : '';
+            const resetText = win.expired ? '已重置' : (win.latest?.remainingMs ? fmtCountdown(win.latest.remainingMs) : '尚未计费');
+            const usage = win.liveUsage || { usd: 0, totalTokens: 0, calls: 0 };
+            const est = win.estimate;
+            const projText = est?.status === 'estimated' && est.projectedLeftPct !== null && !win.expired && Math.abs(est.projectedLeftPct - leftPct) >= 0.8
+              ? ` · 估剩 ${est.projectedLeftPct.toFixed(1)}%`
+              : '';
+            const spendText = usage.calls > 0
+              ? `~${fmtShortUsd(usage.usd)} · ${fmtCompact(usage.totalTokens)} tok (${fmtInt(usage.calls)}次)`
+              : '本周期暂无调用';
+            let estNode = '待消耗 ≥1%';
+            if (est?.status === 'estimated') {
+              const tier = est.confidenceTier || (est.maxUsedPctObserved >= 10 ? 'high' : est.maxUsedPctObserved >= 3 ? 'mid' : 'low');
+              const confLabel = tier === 'high' ? '高置信' : tier === 'mid' ? '收敛中' : '样本偏少';
+              const confTip = `已观测最高消耗 ${est.maxUsedPctObserved ?? '?'}%，估算误差约 ±${est.relErrPct ?? '?'}%`;
+              estNode = [
+                h('span', { key: 'v' }, `~${fmtShortUsd(est.estTotalUsd)} (${fmtShortUsd(est.lowUsd)}–${fmtShortUsd(est.highUsd)})`),
+                h('span', { key: 'b', className: `agy-quota-conf is-${tier}`, title: confTip }, confLabel)
+              ];
+            } else if (est?.status === 'lower_bound') {
+              estNode = [
+                h('span', { key: 'v' }, `> ${fmtShortUsd(est.minBoundUsd)}`),
+                h('span', { key: 'b', className: 'agy-quota-conf is-low', title: '当前仍为 100% 满额，仅能确定总额下界' }, '仅下界')
+              ];
+            }
+            return h(React.Fragment, null,
+              h('div', { className: 'agy-quota-row' },
+                h('span', null, title),
+                h('strong', null, `剩 ${leftPctLabel}${projText} (${resetText})`)
+              ),
+              h('div', { className: 'agy-quota-bar' },
+                h('i', { className: barClass, style: { width: `${Math.max(0, Math.min(100, leftPct))}%` } })
+              ),
+              h('div', { className: 'agy-quota-sub' }, h('span', null, '本周期实耗'), h('strong', null, spendText)),
+              h('div', { className: 'agy-quota-sub' }, h('span', null, '推算总额度'), h('strong', null, estNode))
+            );
+          };
+
+          const renderPool = (pool, isActive) => {
+            if (!pool || (!pool.fiveHour?.sampled && !pool.weekly?.sampled)) return null;
+            return h('div', { className: 'agy-quota-section', key: pool.label },
+              h('div', { className: 'agy-quota-pool-title' },
+                h('span', null, pool.label || 'Pool'),
+                isActive ? h('span', { className: 'agy-quota-badge' }, '当前模型池') : null
+              ),
+              renderWindow('5h 额度', pool.fiveHour),
+              renderWindow('周额度', pool.weekly)
+            );
+          };
+
+          const footText = appState.quotaRefreshing
+            ? '正在自动刷新…'
+            : quota?.hasSamples
+              ? `活跃 5m / 空闲 30–60m 自动刷新 · ${fmtAgo(quota.lastSampledAtMs)}`
+              : '活跃 5m / 空闲 30–60m 自动刷新 · 等待首次更新';
+
+          return h('div', { className: 'dsh-pill-anchor' },
+            h('button', {
+              type: 'button',
+              className: `dsh-pill dsh-pill-btn${openPop === 'quota' ? ' is-open' : ''}`,
+              onClick: () => togglePop('quota'),
+              title: '点击展开「5h / 周额度反推」'
+            },
+              clockSvg,
+              h('span', { className: 'dsh-pill-val' }, pillText)
+            ),
+            openPop === 'quota' ? h('div', { className: 'dsh-popover dsh-popover-quota', role: 'dialog', 'aria-label': '5h 与周额度反推及底栏设置' },
+              quota?.hasSamples
+                ? [renderPool(activePool, true), renderPool(otherPool, false)]
+                : h('div', { className: 'dsh-pop-note' }, '正在等待首次额度读取，结合本地调用记录自动反推 5h 与周总额度。'),
+              h('div', { className: 'agy-quota-settings' },
+                h('div', { className: 'agy-quota-set-head' },
+                  h('span', null, '底栏胶囊显示'),
+                  h('button', {
+                    type: 'button',
+                    className: `agy-quota-switch${qb.enabled ? ' is-on' : ''}`,
+                    onClick: () => updateQuotaBarConfig({ enabled: !qb.enabled })
+                  },
+                    h('span', { className: 'dot' }),
+                    qb.enabled ? '已显示' : '已隐藏'
+                  )
+                ),
+                h('div', { className: `agy-quota-chip-rows${qb.enabled ? '' : ' is-dim'}` },
+                  h('div', { className: 'agy-quota-chip-row' },
+                    h('span', { className: 'agy-quota-chip-lbl' }, 'Gemini'),
+                    h('button', {
+                      type: 'button',
+                      className: `agy-quota-chip${qb.gemini5h ? ' is-on' : ''}`,
+                      onClick: () => updateQuotaBarConfig({ gemini5h: !qb.gemini5h })
+                    }, '5h 额度'),
+                    h('button', {
+                      type: 'button',
+                      className: `agy-quota-chip${qb.geminiWeekly ? ' is-on' : ''}`,
+                      onClick: () => updateQuotaBarConfig({ geminiWeekly: !qb.geminiWeekly })
+                    }, '周额度')
+                  ),
+                  h('div', { className: 'agy-quota-chip-row' },
+                    h('span', { className: 'agy-quota-chip-lbl' }, 'Claude / GPT'),
+                    h('button', {
+                      type: 'button',
+                      className: `agy-quota-chip${qb.claude5h ? ' is-on' : ''}`,
+                      onClick: () => updateQuotaBarConfig({ claude5h: !qb.claude5h })
+                    }, '5h 额度'),
+                    h('button', {
+                      type: 'button',
+                      className: `agy-quota-chip${qb.claudeWeekly ? ' is-on' : ''}`,
+                      onClick: () => updateQuotaBarConfig({ claudeWeekly: !qb.claudeWeekly })
+                    }, '周额度')
+                  )
+                )
+              ),
+              h('div', { className: 'agy-quota-foot' },
+                h('span', null, footText),
+                h('button', {
+                  type: 'button',
+                  className: `agy-quota-refresh${appState.quotaRefreshing ? ' is-spinning' : ''}`,
+                  disabled: appState.quotaRefreshing,
+                  title: appState.quotaRefreshing ? '正在刷新…' : '立即刷新',
+                  'aria-label': '立即刷新',
+                  onClick: triggerQuotaRefresh
+                }, refreshSvg)
+              )
+            ) : null
+          );
+        })()
       )
     );
   }

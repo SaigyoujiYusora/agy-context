@@ -8,8 +8,8 @@
 (function installAgyModelInspectorOverlay() {
   'use strict';
 
-  const VERSION = 'runtime-overlay-v22';
-  const BUILD = '20261116-dsh-stats-v2';
+  const VERSION = 'runtime-overlay-v37';
+  const BUILD = '20261121-quota-native-rpc-v1';
   function loopbackApiBase(value) {
     try {
       const parsed = new URL(String(value || 'http://127.0.0.1:18922'));
@@ -49,6 +49,10 @@
     lastPayload: null,
     forkRequests: [],
     forkPending: null,
+    localQuota: null,
+    localQuotaBar: null,
+    quotaRefreshing: false,
+    quotaRefreshNote: '',
     stopped: false
   };
 
@@ -196,6 +200,130 @@
     .runtime-dot-row strong { color: var(--foreground, #eee); font-weight: 500; }
     .runtime-empty { padding-top: 9px; color: #969aa6; }
     .runtime-error { color: #f0a8a8; }
+    .runtime-popover-quota { width: min(352px, calc(100vw - 24px)); }
+    .runtime-quota-section { padding-top: 0; }
+    .runtime-quota-section + .runtime-quota-section {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid color-mix(in srgb, var(--border, #3a3a3a) 72%, transparent);
+    }
+    .runtime-quota-pool-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--foreground, #eee);
+      margin-bottom: 4px;
+    }
+    .runtime-quota-badge {
+      font-size: 11px;
+      font-weight: 500;
+      padding: 1px 6px;
+      border-radius: 5px;
+      background: color-mix(in srgb, var(--foreground, #fff) 8%, transparent);
+      color: var(--muted-foreground, #b8bec8);
+    }
+    .runtime-quota-bar {
+      height: 4px;
+      margin: 5px 0 3px;
+      border-radius: 3px;
+      background: var(--border, #3a3a3a);
+      overflow: hidden;
+    }
+    .runtime-quota-bar > i {
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: #4ade80;
+    }
+    .runtime-quota-bar > i.is-warn { background: #f59e0b; }
+    .runtime-quota-bar > i.is-crit { background: #ef4444; }
+    .runtime-quota-sub {
+      padding-top: 3px;
+      font-size: 11.5px;
+      color: var(--muted-foreground, #969aa6);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .runtime-quota-sub strong {
+      color: var(--foreground, #ddd);
+      font-weight: 500;
+      text-align: right;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .runtime-quota-conf {
+      display: inline-flex;
+      align-items: center;
+      padding: 0 5px;
+      height: 16px;
+      border-radius: 4px;
+      font-size: 10.5px;
+      font-weight: 500;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    .runtime-quota-conf.is-low {
+      color: #fbbf24;
+      background: rgba(245, 158, 11, 0.14);
+      border: 1px solid rgba(245, 158, 11, 0.34);
+    }
+    .runtime-quota-conf.is-mid {
+      color: #f3f4f6;
+      background: rgba(255, 255, 255, 0.10);
+      border: 1px solid rgba(255, 255, 255, 0.24);
+    }
+    .runtime-quota-conf.is-high {
+      color: #4ade80;
+      background: rgba(74, 222, 128, 0.14);
+      border: 1px solid rgba(74, 222, 128, 0.34);
+    }
+    .runtime-quota-foot {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid color-mix(in srgb, var(--border, #3a3a3a) 72%, transparent);
+      font-size: 11px;
+      color: var(--muted-foreground, #8e929f);
+      line-height: 1.4;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .runtime-quota-refresh {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border-radius: 6px;
+      border: 1px solid color-mix(in srgb, var(--border, #444) 85%, transparent);
+      background: color-mix(in srgb, var(--foreground, #fff) 6%, transparent);
+      color: var(--muted-foreground, #c2c4ca);
+      cursor: pointer;
+      transition: background 120ms ease, color 120ms ease;
+    }
+    .runtime-quota-refresh:hover {
+      background: color-mix(in srgb, var(--foreground, #fff) 14%, transparent);
+      color: var(--foreground, #f1f2f6);
+    }
+    .runtime-quota-refresh:disabled {
+      opacity: 0.6;
+      cursor: wait;
+    }
+    .runtime-quota-refresh.is-spinning svg {
+      animation: agy-quota-spin 0.85s linear infinite;
+    }
+    @keyframes agy-quota-spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
     @media (max-width: 560px) {
       .runtime-pill { padding: 0 7px; }
     }
@@ -382,6 +510,8 @@
       teamOutput,
       teamCacheHit,
       usd: teamUsd,
+      quota: payload.quota || state.localQuota || null,
+      quotaBar: payload.quotaBar || state.localQuotaBar || null,
       revision: String(payload.revision || [summary.invocationCount, teamTotalTokens, subagentCount, contextUsed].join(':'))
     };
   }
@@ -469,8 +599,16 @@
         <div class="runtime-pill-wrap" data-key="session"><button class="runtime-pill" type="button" aria-expanded="false"><span class="runtime-icon">${GAUGE_ICON}</span><span class="runtime-label" data-field="session-label">会话统计</span></button><div class="runtime-popover" data-popover="session"></div></div>
         <div class="runtime-pill-wrap" data-key="tokens"><button class="runtime-pill" type="button" aria-expanded="false"><span class="runtime-icon">${DATABASE_ICON}</span><span class="runtime-label" data-field="tokens-label">Token 用量</span></button><div class="runtime-popover" data-popover="tokens"></div></div>
         <div class="runtime-pill-wrap" data-key="context"><button class="runtime-pill" type="button" aria-expanded="false"><span class="runtime-icon" data-field="context-ring">${contextRing(0)}</span><span class="runtime-label" data-field="context-label">上下文</span></button><div class="runtime-popover" data-popover="context"></div></div>
+        <div class="runtime-pill-wrap" data-key="quota"><button class="runtime-pill" type="button" aria-expanded="false"><span class="runtime-icon">${QUOTA_ICON}</span><span class="runtime-label" data-field="quota-label">额度推算</span></button><div class="runtime-popover runtime-popover-quota" data-popover="quota"></div></div>
       </div>`;
       for (const wrap of shadow.querySelectorAll('.runtime-pill-wrap')) bindPopover(wrap);
+      shadow.addEventListener('click', (ev) => {
+        const btn = ev.target?.closest?.('[data-action="quota-refresh"]');
+        if (!btn) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        triggerRpcQuotaRefresh();
+      });
       state.shadow = shadow;
     } else {
       const style = host.shadowRoot.querySelector('style');
@@ -585,10 +723,12 @@
         ];
     q.querySelector('[data-popover="tokens"]').innerHTML = `<div class="runtime-popover-header"><span>${hasSubagents ? 'Token 用量 (含子代理)' : 'Token 用量'}</span><strong>${esc(formatInteger(totalTokens))} tok</strong></div>${rows(tokenRows)}`;
     q.querySelector('[data-popover="context"]').innerHTML = `<div class="runtime-popover-header"><span>上下文用量</span><strong>${esc(percent(contextPct))} · ~${esc(formatCompact(model.contextUsed))} / ${esc(formatCompact(model.contextWindow))}</strong></div>${contextBar(model, contextPct)}${bucketRows(model)}${model.contextEstimateNote ? '<div class="runtime-empty" style="font-size:11px">'+esc(model.contextEstimateNote)+'</div>' : ''}`;
+    renderQuota(q, model);
     for (const popover of q.querySelectorAll('.runtime-popover:popover-open')) positionPopover(popover, popover.parentElement.querySelector('button'));
     for (const wrap of q.querySelectorAll('.runtime-pill-wrap')) {
       const button = wrap.querySelector('button');
-      button?.setAttribute('title', wrap.dataset.key === 'session' ? '会话统计' : wrap.dataset.key === 'tokens' ? 'Token 用量' : '上下文用量');
+      const k = wrap.dataset.key;
+      button?.setAttribute('title', k === 'session' ? '会话统计' : k === 'tokens' ? 'Token 用量' : k === 'quota' ? '5h / 周额度反推' : '上下文用量');
     }
     hideNativeBadges();
     injectReplyBadges(model);
@@ -626,6 +766,216 @@
   const BRANCH_ICON = svgIcon('<path d="M1.01503 8.0001L5.6964 8.0001C6.41913 8.0001 6.78049 8.0001 7.12115 7.91951C7.4232 7.84804 7.71233 7.73014 7.97821 7.57C8.27809 7.38939 8.5364 7.13669 9.05303 6.63129L11.3281 4.40564" stroke="currentColor"/><path d="M1.01221 7.9999L5.6964 7.9999C6.41913 7.9999 6.78049 7.9999 7.12115 8.08049C7.4232 8.15196 7.71233 8.26986 7.97821 8.43C8.27809 8.61061 8.5364 8.86331 9.05303 9.36871L11.3281 11.5944" stroke="currentColor"/><circle cx="12.4502" cy="3.3079" r="1.56962" stroke="currentColor"/><circle cx="12.4502" cy="12.6921" r="1.56962" stroke="currentColor"/>');
   const DATABASE_ICON = svgIcon('<path d="M13.1967 5.1869C13.7232 4.77378 14.0003 4.30517 14.0001 3.82819C14.0003 3.3512 13.7232 2.88259 13.1967 2.46947C12.6702 2.05635 11.9128 1.71328 11.0006 1.47475C10.0885 1.23621 9.05371 1.11062 8.00039 1.1106C6.94707 1.11057 5.9123 1.23612 5.00009 1.47461C4.08742 1.71301 3.32948 2.05604 2.80249 2.46919C2.2755 2.88235 1.99805 3.35106 1.99805 3.82819C1.99805 4.30531 2.2755 4.77402 2.80249 5.18718C3.32948 5.60033 4.08742 5.94336 5.00009 6.18176C5.9123 6.42025 6.94707 6.5458 8.00039 6.54578C9.05371 6.54575 10.0885 6.42016 11.0006 6.18163C11.9128 5.94309 12.6702 5.60002 13.1967 5.1869Z" stroke="currentColor"/><path d="M2 3.80371V11.7848M14 3.80371V11.7848" stroke="currentColor"/><path d="M2 7.81396C2 8.60524 2.63214 9.36411 3.75736 9.92363C4.88258 10.4832 6.4087 10.7975 8 10.7975C9.5913 10.7975 11.1174 10.4832 12.2426 9.92363C13.3679 9.36411 14 8.60524 14 7.81396" stroke="currentColor"/><path d="M2 11.7847C2 12.6081 2.63214 13.3977 3.75736 13.98C4.88258 14.5622 6.4087 14.8893 8 14.8893C9.5913 14.8893 11.1174 14.5622 12.2426 13.98C13.3679 13.3977 14 12.6081 14 11.7847" stroke="currentColor"/>');
   const GAUGE_ICON = svgIcon('<path d="M3.4041 13.096C2.49514 12.187 1.87614 11.0288 1.62537 9.76798C1.37459 8.50716 1.50331 7.20028 1.99525 6.01261C2.48719 4.82494 3.32025 3.80981 4.3891 3.09557C5.45795 2.38134 6.71458 2.00008 8.0001 2C9.28563 2.00008 10.5423 2.38134 11.6111 3.09557C12.68 3.80981 13.513 4.82494 14.005 6.01261C14.4969 7.20028 14.6256 8.50716 14.3748 9.76798C14.1241 11.0288 13.5051 12.187 12.5961 13.096" stroke="currentColor"/><path d="M8 8.49994L11.6114 4.88855" stroke="currentColor"/><path d="M8 9.75C8.69036 9.75 9.25 9.19036 9.25 8.5C9.25 7.80964 8.69036 7.25 8 7.25C7.30964 7.25 6.75 7.80964 6.75 8.5C6.75 9.19036 7.30964 9.75 8 9.75Z" fill="currentColor"/>');
+  const QUOTA_ICON = svgIcon('<circle cx="8" cy="8" r="6" stroke="currentColor"/><path d="M8 4.4V8L10.6 9.6" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>');
+  const REFRESH_ICON = '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.45-3.73"/><path d="M13.5 2.5v2.75h-2.75"/></svg>';
+
+  function formatShortUsd(value) {
+    const n = number(value);
+    if (!(n > 0)) return '$0';
+    if (n >= 100) return `$${Math.round(n)}`;
+    if (n >= 10) return `$${n.toFixed(1)}`;
+    return `$${n.toFixed(2)}`;
+  }
+
+  function formatCountdown(ms) {
+    const totalMin = Math.max(0, Math.round(number(ms) / 60000));
+    if (totalMin < 1) return '即将重置';
+    const d = Math.floor(totalMin / 1440);
+    const h = Math.floor((totalMin % 1440) / 60);
+    const m = totalMin % 60;
+    if (d > 0) return h > 0 ? `${d}d ${h}h 后重置` : `${d}d 后重置`;
+    if (h > 0) return m > 0 ? `${h}h ${m}m 后重置` : `${h}h 后重置`;
+    return `${m}m 后重置`;
+  }
+
+  function formatAgo(ms) {
+    const sec = Math.max(0, Math.round((Date.now() - number(ms)) / 1000));
+    if (sec < 60) return '刚刚更新';
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `${min}分钟前更新`;
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return `${hr}小时前更新`;
+    return `${Math.floor(hr / 24)}天前更新`;
+  }
+
+  function detectActiveQuotaPool(model) {
+    const probe = [
+      model?.latest?.sentModel,
+      model?.latest?.responseModel,
+      model?.latest?.modelDisplayName,
+      model?.latest?.apiProvider
+    ].filter(Boolean).join(' ').toLowerCase();
+    return /claude|anthropic|gpt|openai/.test(probe) ? 'claude_gpt' : 'gemini';
+  }
+
+  async function triggerRpcQuotaRefresh() {
+    if (state.stopped || state.quotaRefreshing) return;
+    state.quotaRefreshing = true;
+    state.quotaRefreshNote = '';
+    if (state.shadow && state.lastPayload) renderQuota(state.shadow, state.lastPayload);
+    try {
+      const res = await fetch(`${API_BASE}/api/quota-refresh`, { method: 'POST' });
+      const data = res.ok ? await res.json() : null;
+      if (data?.quota) {
+        state.localQuota = data.quota;
+        if (state.lastPayload) state.lastPayload.quota = data.quota;
+      }
+      if (data && !data.ok) {
+        state.quotaRefreshNote = data.fetched?.error || data.error || '刷新失败';
+      }
+    } catch {
+      state.quotaRefreshNote = '连接侧栏服务失败';
+    } finally {
+      state.quotaRefreshing = false;
+      if (state.shadow && state.lastPayload) renderQuota(state.shadow, state.lastPayload);
+    }
+  }
+
+  function formatLeftPct(win, expiredText = '已重置') {
+    if (!win?.sampled) return '--';
+    if (win.expired) return expiredText;
+    const v = number(win.latest?.leftPct, 100);
+    if (v >= 99.95) return '100%';
+    return win.latest?.exactFraction ? `${v.toFixed(1)}%` : `${Math.round(v)}%`;
+  }
+
+  function renderQuotaWindowBlock(title, win) {
+    if (!win || !win.sampled) {
+      return `<div class="runtime-row"><span>${esc(title)}</span><strong>未采样</strong></div>`;
+    }
+    const leftPct = win.expired ? 100 : number(win.latest?.leftPct, 100);
+    const leftPctLabel = formatLeftPct(win, '100%');
+    const barClass = leftPct <= 15 ? 'is-crit' : leftPct <= 40 ? 'is-warn' : '';
+    const resetText = win.expired
+      ? '已重置'
+      : win.latest?.remainingMs
+        ? formatCountdown(win.latest.remainingMs)
+        : '尚未计费';
+    const usage = win.liveUsage || { usd: 0, totalTokens: 0, calls: 0 };
+    const est = win.estimate;
+    let estHtml = esc('待消耗 ≥1%');
+    if (est?.status === 'estimated') {
+      const tier = est.confidenceTier || (est.maxUsedPctObserved >= 10 ? 'high' : est.maxUsedPctObserved >= 3 ? 'mid' : 'low');
+      const confLabel = tier === 'high' ? '高置信' : tier === 'mid' ? '收敛中' : '样本偏少';
+      const confTip = `已观测最高消耗 ${est.maxUsedPctObserved ?? '?'}%，估算误差约 ±${est.relErrPct ?? '?'}%`;
+      estHtml = `${esc(`~${formatShortUsd(est.estTotalUsd)} (${formatShortUsd(est.lowUsd)}–${formatShortUsd(est.highUsd)})`)}<span class="runtime-quota-conf is-${tier}" title="${esc(confTip)}">${esc(confLabel)}</span>`;
+    } else if (est?.status === 'lower_bound') {
+      estHtml = `${esc(`> ${formatShortUsd(est.minBoundUsd)}`)}<span class="runtime-quota-conf is-low" title="当前仍为 100% 满额，仅能确定总额下界">仅下界</span>`;
+    }
+    const spendLine = usage.calls > 0
+      ? `~${formatShortUsd(usage.usd)} · ${formatCompact(usage.totalTokens)} tok (${formatInteger(usage.calls)}次)`
+      : '本周期暂无调用';
+    const projLine = est?.status === 'estimated' && est.projectedLeftPct !== null && !win.expired && Math.abs(est.projectedLeftPct - leftPct) >= 0.8
+      ? ` · 估剩 ${est.projectedLeftPct.toFixed(1)}%`
+      : '';
+    return `
+      <div class="runtime-row"><span>${esc(title)}</span><strong>剩 ${esc(leftPctLabel)}${esc(projLine)} (${esc(resetText)})</strong></div>
+      <div class="runtime-quota-bar"><i class="${barClass}" style="width:${Math.max(0, Math.min(100, leftPct))}%"></i></div>
+      <div class="runtime-quota-sub"><span>本周期实耗</span><strong>${esc(spendLine)}</strong></div>
+      <div class="runtime-quota-sub"><span>推算总额度</span><strong>${estHtml}</strong></div>
+    `;
+  }
+
+  function formatQuotaPillLabel(quota, quotaBar, activePoolKey) {
+    const qb = {
+      enabled: quotaBar?.enabled !== false,
+      gemini5h: quotaBar?.gemini5h !== undefined ? Boolean(quotaBar.gemini5h) : true,
+      geminiWeekly: Boolean(quotaBar?.geminiWeekly),
+      claude5h: Boolean(quotaBar?.claude5h),
+      claudeWeekly: Boolean(quotaBar?.claudeWeekly)
+    };
+    const gPool = quota?.pools?.gemini;
+    const cPool = quota?.pools?.claude_gpt;
+    const pctStr = (win) => formatLeftPct(win, '重置');
+    const singleWinStr = (prefix, tag, win) => {
+      if (!win?.sampled) return `${prefix}${tag} --`;
+      const left = formatLeftPct(win, '已重置');
+      const usd = win.estimate?.status === 'estimated' ? ` · ~${formatShortUsd(win.estimate.estTotalUsd)}` : '';
+      return `${prefix}${tag} ${left}${usd}`;
+    };
+
+    const gSel = [qb.gemini5h ? '5h' : '', qb.geminiWeekly ? 'wk' : ''].filter(Boolean);
+    const cSel = [qb.claude5h ? '5h' : '', qb.claudeWeekly ? 'wk' : ''].filter(Boolean);
+    const totalSel = gSel.length + cSel.length;
+
+    if (totalSel === 0) {
+      const pool = quota?.pools?.[activePoolKey] || gPool;
+      const prefix = activePoolKey === 'claude_gpt' ? 'C/G ' : '';
+      return singleWinStr(prefix, '5h', pool?.fiveHour);
+    }
+    if (totalSel === 1) {
+      if (qb.gemini5h) return singleWinStr('', '5h', gPool?.fiveHour);
+      if (qb.geminiWeekly) return singleWinStr('', '周', gPool?.weekly);
+      if (qb.claude5h) return singleWinStr('C/G ', '5h', cPool?.fiveHour);
+      return singleWinStr('C/G ', '周', cPool?.weekly);
+    }
+    if (gSel.length === 2 && cSel.length === 0) {
+      return `5h ${pctStr(gPool?.fiveHour)} · 周 ${pctStr(gPool?.weekly)}`;
+    }
+    if (cSel.length === 2 && gSel.length === 0) {
+      return `C/G 5h ${pctStr(cPool?.fiveHour)} · 周 ${pctStr(cPool?.weekly)}`;
+    }
+    const fmtPoolCompact = (tag, pool, has5h, hasWk) => {
+      if (has5h && hasWk) return `${tag} ${pctStr(pool?.fiveHour)}/${pctStr(pool?.weekly)}`;
+      if (has5h) return `${tag} 5h ${pctStr(pool?.fiveHour)}`;
+      return `${tag} 周 ${pctStr(pool?.weekly)}`;
+    };
+    const parts = [];
+    if (gSel.length) parts.push(fmtPoolCompact('G', gPool, qb.gemini5h, qb.geminiWeekly));
+    if (cSel.length) parts.push(fmtPoolCompact('C/G', cPool, qb.claude5h, qb.claudeWeekly));
+    return parts.join(' · ');
+  }
+
+  function renderQuota(q, model) {
+    const wrapEl = q.querySelector('.runtime-pill-wrap[data-key="quota"]');
+    const labelEl = q.querySelector('[data-field="quota-label"]');
+    const popEl = q.querySelector('[data-popover="quota"]');
+    if (!labelEl || !popEl) return;
+
+    const quotaBar = model.quotaBar || state.localQuotaBar || null;
+    const isEnabled = quotaBar?.enabled !== false;
+    if (wrapEl) {
+      wrapEl.style.display = isEnabled ? '' : 'none';
+      if (!isEnabled && popEl.matches(':popover-open')) {
+        try { popEl.hidePopover(); } catch {}
+      }
+    }
+
+    const quota = model.quota || state.localQuota || null;
+    const refreshBtn = `<button type="button" class="runtime-quota-refresh${state.quotaRefreshing ? ' is-spinning' : ''}" data-action="quota-refresh" title="${state.quotaRefreshing ? '正在刷新…' : '立即刷新'}" aria-label="立即刷新"${state.quotaRefreshing ? ' disabled' : ''}>${REFRESH_ICON}</button>`;
+    if (!quota || !quota.hasSamples) {
+      labelEl.textContent = state.quotaRefreshing ? '刷新中…' : '额度推算';
+      const emptyFoot = state.quotaRefreshing ? '正在刷新…' : '活跃 5m / 空闲 30–60m 自动刷新 · 等待首次更新';
+      popEl.innerHTML = `<div class="runtime-empty" style="padding-top:0">正在等待首次额度读取，结合本地调用记录自动反推 5h 与周总额度。</div><div class="runtime-quota-foot"><span>${esc(emptyFoot)}</span>${refreshBtn}</div>`;
+      return;
+    }
+
+    const activePoolKey = detectActiveQuotaPool(model);
+    const activePool = quota.pools?.[activePoolKey] || quota.pools?.gemini;
+    const otherPoolKey = activePoolKey === 'gemini' ? 'claude_gpt' : 'gemini';
+    const otherPool = quota.pools?.[otherPoolKey];
+
+    labelEl.textContent = formatQuotaPillLabel(quota, quotaBar, activePoolKey);
+
+    const renderPoolSection = (pool, isActive) => {
+      if (!pool || (!pool.fiveHour?.sampled && !pool.weekly?.sampled)) return '';
+      return `<div class="runtime-quota-section">
+        <div class="runtime-quota-pool-title"><span>${esc(pool.label || 'Pool')}</span>${isActive ? '<span class="runtime-quota-badge">当前模型池</span>' : ''}</div>
+        ${renderQuotaWindowBlock('5h 额度', pool.fiveHour)}
+        ${renderQuotaWindowBlock('周额度', pool.weekly)}
+      </div>`;
+    };
+
+    const footNote = state.quotaRefreshing
+      ? '正在刷新…'
+      : state.quotaRefreshNote
+        ? `刷新提示：${state.quotaRefreshNote}`
+        : `活跃 5m / 空闲 30–60m 自动刷新 · ${formatAgo(quota.lastSampledAtMs)}`;
+    popEl.innerHTML =
+      renderPoolSection(activePool, true) +
+      renderPoolSection(otherPool, false) +
+      `<div class="runtime-quota-foot"><span>${esc(footNote)}</span>${refreshBtn}</div>`;
+  }
 
   // DSH ContextMeter.tsx: r=5.5, 14px viewBox, a round-capped 2px arc.
   function contextRing(pct) {
@@ -764,6 +1114,8 @@
 
   function update(payload) {
     if (state.stopped) return;
+    if (payload?.quota) state.localQuota = payload.quota;
+    if (payload?.quotaBar) state.localQuotaBar = payload.quotaBar;
     render(payload);
   }
 
@@ -787,6 +1139,7 @@
 
   function stop() {
     state.stopped = true;
+    document.getElementById('agy-quota-autoscan-cloak')?.remove();
     restoreFooterSpacing();
     for (const host of [state.host, ...document.querySelectorAll('[data-agy-runtime-turn-usage], [data-agy-runtime-fork]')]) {
       for (const popover of host?.shadowRoot?.querySelectorAll('.runtime-popover:popover-open') || []) popover.hidePopover();
@@ -795,6 +1148,16 @@
 
   // The external injector refreshes on its bounded polling interval. Observing
   // our own DOM insertions is unnecessary and can create a feedback loop.
-  globalThis.__AGY_MODEL_INSPECTOR_OVERLAY__ = { version: VERSION, build: BUILD, refresh, update, tick, stop, drainForkRequests: () => state.forkRequests.splice(0), resolveFork };
+  globalThis.__AGY_MODEL_INSPECTOR_OVERLAY__ = {
+    version: VERSION,
+    build: BUILD,
+    refresh,
+    update,
+    tick,
+    stop,
+    drainForkRequests: () => state.forkRequests.splice(0),
+    drainQuotaSamples: () => [],
+    resolveFork
+  };
   refresh();
 })();

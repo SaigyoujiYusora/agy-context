@@ -29,25 +29,56 @@ export function ensurePluginDataDir() {
   } catch {}
 }
 
+export const DEFAULT_QUOTA_BAR = {
+  enabled: true,
+  gemini5h: true,
+  geminiWeekly: false,
+  claude5h: false,
+  claudeWeekly: false
+};
+
+export function normalizeQuotaBarConfig(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  return {
+    enabled: src.enabled !== undefined ? Boolean(src.enabled) : DEFAULT_QUOTA_BAR.enabled,
+    gemini5h: src.gemini5h !== undefined ? Boolean(src.gemini5h) : DEFAULT_QUOTA_BAR.gemini5h,
+    geminiWeekly: src.geminiWeekly !== undefined ? Boolean(src.geminiWeekly) : DEFAULT_QUOTA_BAR.geminiWeekly,
+    claude5h: src.claude5h !== undefined ? Boolean(src.claude5h) : DEFAULT_QUOTA_BAR.claude5h,
+    claudeWeekly: src.claudeWeekly !== undefined ? Boolean(src.claudeWeekly) : DEFAULT_QUOTA_BAR.claudeWeekly
+  };
+}
+
 export function getPluginConfig() {
   ensurePluginDataDir();
   const defaults = {
     tpsMode: 'decode', // 'decode' (post-TTFT pure decode) | 'e2e' (includes TTFT: outputTokens / (ttft + stream))
     showTokenDetails: true,
     showTTFT: true,
-    showInternalEnum: true
+    showInternalEnum: true,
+    quotaBar: { ...DEFAULT_QUOTA_BAR }
   };
   try {
     if (fs.existsSync(CONFIG_FILE)) {
       const parsed = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-      return { ...defaults, ...parsed };
+      return {
+        ...defaults,
+        ...parsed,
+        quotaBar: normalizeQuotaBarConfig(parsed?.quotaBar)
+      };
     }
   } catch {}
   return defaults;
 }
 
 export function savePluginConfig(partial) {
-  const merged = { ...getPluginConfig(), ...partial };
+  const current = getPluginConfig();
+  const merged = {
+    ...current,
+    ...partial,
+    quotaBar: partial?.quotaBar
+      ? normalizeQuotaBarConfig({ ...current.quotaBar, ...partial.quotaBar })
+      : current.quotaBar
+  };
   ensurePluginDataDir();
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(merged, null, 2), 'utf8');
   return merged;
