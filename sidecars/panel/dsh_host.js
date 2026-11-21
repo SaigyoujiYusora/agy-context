@@ -2366,13 +2366,6 @@
               : null
           ),
           h('div', { className: 'dsh-session-right' },
-            h('a', { className: 'dsh-chrome-btn', href: '/prompts?conversationId=' + encodeURIComponent(curCid) }, '提示词预设'),
-            h('button', {
-              type: 'button',
-              className: 'dsh-chrome-btn mono',
-              onClick: toggleContextModal,
-              title: '打开 dsh-context /context 快速检查弹窗'
-            }, '/context'),
             h('button', {
               type: 'button',
               className: 'dsh-chrome-btn',
