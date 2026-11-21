@@ -12,6 +12,7 @@ import {
   getGlobalInsights
 } from './model_core.mjs';
 import { getQuotaAnalytics } from './quota_estimator.mjs';
+import { getCachedUpdateStatus } from './update_checker.mjs';
 
 const BRAIN_DIR = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
 const CONFIG_ROOT = path.join(os.homedir(), '.gemini', 'config');
@@ -766,10 +767,12 @@ export function buildDshBootstrap(conversationId, cfg = getPluginConfig(), prelo
 
   const fleetUsage = built?.analytics?.fleetUsage || null;
   const quota = getQuotaAnalytics();
+  const updateStatus = getCachedUpdateStatus();
   const headNodes = built?.head?.nodes || [];
   const lastSeq = headNodes.length > 0 ? headNodes[headNodes.length - 1].seq : 0;
   const qb = cfg?.quotaBar || {};
   const qbSig = `${qb.enabled !== false ? 1 : 0}${qb.gemini5h ? 1 : 0}${qb.geminiWeekly ? 1 : 0}${qb.claude5h ? 1 : 0}${qb.claudeWeekly ? 1 : 0}`;
+  const updSig = `u:${updateStatus?.latestVersion || ''}:${updateStatus?.hasUpdate ? 1 : 0}:${updateStatus?.checkedAtMs || 0}:${updateStatus?.error ? 1 : 0}`;
   const revision = [
     targetId,
     sum?.invocationCount || 0,
@@ -781,6 +784,7 @@ export function buildDshBootstrap(conversationId, cfg = getPluginConfig(), prelo
     cfg?.tpsMode || 'decode',
     qbSig,
     quota?.revision || 'q:0',
+    updSig,
     recent.length
   ].join(':');
 
@@ -790,6 +794,7 @@ export function buildDshBootstrap(conversationId, cfg = getPluginConfig(), prelo
     config: cfg,
     inflight,
     quota,
+    updateStatus,
     summary: sum ? { ...sum, invocations: undefined } : null,
     head: built?.head || null,
     fleet,

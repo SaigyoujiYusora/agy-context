@@ -360,6 +360,162 @@
       padding: 0 16px;
     }
 
+    /* ── Plugin Version & Update Card (Settings Tab) ────────────────────── */
+    .agy-update-card {
+      margin-bottom: 14px;
+      padding: 13px 16px;
+      border-radius: 11px;
+      border: 1px solid var(--dsw-alias-border-l2);
+      background: var(--dsw-alias-bg-layer-1);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .agy-update-card.has-update {
+      border-color: rgba(52, 211, 153, 0.40);
+      background: linear-gradient(180deg, rgba(16, 185, 129, 0.07), var(--dsw-alias-bg-layer-1));
+    }
+    .agy-update-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .agy-update-info {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+    .agy-update-title-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .agy-update-title {
+      font-size: 13.5px;
+      font-weight: 600;
+      color: var(--dsw-alias-label-primary);
+    }
+    .agy-update-ver {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      padding: 1px 6px;
+      border-radius: 5px;
+      background: var(--dsw-alias-bg-layer-2);
+      color: var(--dsw-alias-label-secondary);
+      border: 1px solid var(--dsw-alias-border-l2);
+    }
+    .agy-update-badge {
+      font-size: 11.5px;
+      font-weight: 500;
+      padding: 1px 7px;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+    .agy-update-badge.is-new {
+      color: #34d399;
+      background: rgba(16, 185, 129, 0.14);
+      border: 1px solid rgba(52, 211, 153, 0.35);
+    }
+    .agy-update-badge.is-ok {
+      color: var(--dsw-alias-label-secondary);
+      background: var(--dsw-alias-bg-layer-2);
+      border: 1px solid var(--dsw-alias-border-l2);
+    }
+    .agy-update-badge.is-err {
+      color: #fbbf24;
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid rgba(245, 158, 11, 0.32);
+    }
+    body:not([data-ds-dark-theme]) .agy-update-badge.is-new {
+      color: #047857;
+      background: rgba(16, 185, 129, 0.12);
+      border-color: rgba(5, 150, 105, 0.34);
+    }
+    body:not([data-ds-dark-theme]) .agy-update-badge.is-err {
+      color: #b45309;
+      background: rgba(245, 158, 11, 0.12);
+      border-color: rgba(217, 119, 6, 0.34);
+    }
+    .agy-update-meta {
+      font-size: 11.5px;
+      color: var(--dsw-alias-label-tertiary);
+    }
+    .agy-update-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: none;
+    }
+    .agy-update-btn {
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 5px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--dsw-alias-border-l2);
+      background: var(--dsw-alias-bg-layer-2);
+      color: var(--dsw-alias-label-primary);
+      font-size: 12px;
+      font-weight: 500;
+      font-family: inherit;
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.14s ease;
+    }
+    .agy-update-btn:hover:not(:disabled) {
+      background: var(--dsw-alias-interactive-bg-hover);
+      border-color: var(--dsw-alias-border-l1);
+    }
+    .agy-update-btn:disabled {
+      opacity: 0.55;
+      cursor: wait;
+    }
+    .agy-update-btn.is-primary {
+      background: rgba(16, 185, 129, 0.15);
+      border-color: rgba(52, 211, 153, 0.42);
+      color: #34d399;
+    }
+    body:not([data-ds-dark-theme]) .agy-update-btn.is-primary {
+      color: #047857;
+      border-color: rgba(5, 150, 105, 0.38);
+    }
+    .agy-update-notes {
+      margin: 0;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: var(--dsw-alias-bg-layer-2);
+      border: 1px solid var(--dsw-alias-border-l2);
+      color: var(--dsw-alias-label-secondary);
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+    .agy-update-cmd-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 8px;
+      background: var(--dsw-alias-bg-layer-2);
+      border: 1px solid var(--dsw-alias-border-l2);
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--dsw-alias-label-primary);
+    }
+    .agy-update-cmd-row code {
+      font-family: inherit;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+
     .agy-empty-box {
       padding: 40px 20px;
       text-align: center;
@@ -1139,7 +1295,7 @@
   <div id="app-root"></div>
   <script src="/vendor/react.production.min.js"></script>
   <script src="/vendor/react-dom.production.min.js"></script>
-  <script src="/dsh_host.js?v=1.2.5"></script>
+  <script src="/dsh_host.js?v=1.2.7"></script>
   <script src="/vendor/dsh-context-client.js?v=1.2.4"></script>
   <script>if (window.__AGY_DSH_HOST__) window.__AGY_DSH_HOST__.initHost();</script>
 </body>

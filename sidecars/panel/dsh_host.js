@@ -512,6 +512,8 @@
     popover: null, // null | 'stats' | 'tokens' | 'quota'
     tpsSwitching: false,
     quotaRefreshing: false,
+    updateChecking: false,
+    updateCmdCopied: false,
     loading: true,
     error: null
   };
@@ -1016,6 +1018,26 @@
     }
   }
 
+  async function triggerUpdateCheck() {
+    if (appState.updateChecking) return;
+    appState.updateChecking = true;
+    notifyStore();
+    try {
+      const res = await fetch('/api/update-check', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.updateStatus && appState.bootstrap) {
+          appState.bootstrap = { ...appState.bootstrap, updateStatus: data.updateStatus };
+          notifyStore();
+        }
+      }
+      appState.lastRevision = '';
+      await fetchBootstrap(appState.conversationId, false);
+    } catch {} finally {
+      appState.updateChecking = false;
+      notifyStore();
+    }
+  }
 
   async function updateQuotaBarConfig(patch) {
     const prevCfg = appState.bootstrap?.config || {};
@@ -2070,6 +2092,99 @@
     );
   }
 
+  // ── Plugin Version & Update Card (Settings Tab) ───────────────────────────
+  function UpdateCard({ updateStatus, locale }) {
+    const isEn = locale === 'en';
+    const curVer = updateStatus?.currentVersion || '1.2.2';
+    const latestVer = updateStatus?.latestVersion || '';
+    const hasUpdate = Boolean(updateStatus?.hasUpdate && latestVer);
+    const errMsg = updateStatus?.error || '';
+    const checkedAtMs = Number(updateStatus?.checkedAtMs || 0);
+    const sourceLabel = updateStatus?.source === 'github_release'
+      ? 'GitHub Release'
+      : updateStatus?.source === 'github_main'
+        ? 'GitHub main'
+        : '';
+    const linkUrl = updateStatus?.releaseUrl || updateStatus?.repoUrl || 'https://github.com/SaigyoujiYusora/agy-context';
+    const updateCmd = 'git pull && pwsh ./install.ps1';
+
+    let badgeClass = 'agy-update-badge is-ok';
+    let badgeText = isEn ? 'Not checked yet' : '尚未检查';
+    if (hasUpdate) {
+      badgeClass = 'agy-update-badge is-new';
+      badgeText = isEn ? `Update available: v${latestVer}` : `发现新版本 v${latestVer}`;
+    } else if (errMsg) {
+      badgeClass = 'agy-update-badge is-err';
+      badgeText = isEn ? 'Check failed' : '检查失败';
+    } else if (checkedAtMs > 0) {
+      badgeClass = 'agy-update-badge is-ok';
+      badgeText = isEn ? 'Up to date' : '已是最新版本';
+    }
+
+    const metaParts = [];
+    if (checkedAtMs > 0) {
+      const clock = fmtClockHms(checkedAtMs);
+      metaParts.push(isEn ? `Last checked ${clock}` : `上次检查 ${clock}`);
+    }
+    if (sourceLabel) metaParts.push(sourceLabel);
+    if (errMsg) metaParts.push(errMsg);
+    if (metaParts.length === 0) {
+      metaParts.push(isEn ? 'Auto-checks GitHub every 12h' : '每 12 小时自动检测一次 GitHub 更新');
+    }
+
+    const handleCopyCmd = () => {
+      writeClipboard(updateCmd);
+      appState.updateCmdCopied = true;
+      notifyStore();
+      setTimeout(() => {
+        appState.updateCmdCopied = false;
+        notifyStore();
+      }, 1800);
+    };
+
+    return h('section', { className: `agy-update-card${hasUpdate ? ' has-update' : ''}` },
+      h('div', { className: 'agy-update-top' },
+        h('div', { className: 'agy-update-info' },
+          h('div', { className: 'agy-update-title-row' },
+            h('span', { className: 'agy-update-title' }, isEn ? 'Update Check' : '检查更新'),
+            h('span', { className: 'agy-update-ver' }, `v${curVer}`),
+            h('span', { className: badgeClass, title: errMsg || undefined }, badgeText)
+          ),
+          h('div', { className: 'agy-update-meta' }, metaParts.join(' · '))
+        ),
+        h('div', { className: 'agy-update-actions' },
+          h('button', {
+            type: 'button',
+            className: 'agy-update-btn',
+            disabled: appState.updateChecking,
+            onClick: triggerUpdateCheck
+          }, appState.updateChecking ? (isEn ? 'Checking…' : '检查中…') : (isEn ? 'Check now' : '立即检查')),
+          hasUpdate
+            ? h('a', {
+                className: 'agy-update-btn is-primary',
+                href: linkUrl,
+                target: '_blank',
+                rel: 'noreferrer'
+              }, isEn ? 'View release' : '查看新版本')
+            : null
+        )
+      ),
+      hasUpdate && updateStatus?.notes
+        ? h('pre', { className: 'agy-update-notes' }, updateStatus.notes)
+        : null,
+      hasUpdate
+        ? h('div', { className: 'agy-update-cmd-row' },
+            h('code', null, updateCmd),
+            h('button', {
+              type: 'button',
+              className: 'agy-update-btn',
+              onClick: handleCopyCmd
+            }, appState.updateCmdCopied ? (isEn ? 'Copied' : '已复制') : (isEn ? 'Copy command' : '复制更新命令'))
+          )
+        : null
+    );
+  }
+
   // ── Root Application ──────────────────────────────────────────────────────
   function App() {
     const [, setTick] = React.useState(0);
@@ -2289,6 +2404,7 @@
                         ? h(InvocationsTableTab, { conversationId: curCid, summary: bs?.summary, fleetUsage: bs?.fleetUsage, config: bs?.config })
                         : appState.activeTab === 'settings' && SettingsViewComp
                           ? h('div', { className: 'agy-settings-wrap' },
+                              h(UpdateCard, { updateStatus: bs?.updateStatus, locale: activeLocaleVal }),
                               h(SettingsViewComp, {
                                 useContextSettings: useRealSettingsHook,
                                 set: settingsInjected?.set || updateDshSetting

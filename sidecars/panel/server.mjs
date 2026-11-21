@@ -12,6 +12,11 @@ import {
   startQuotaAutoRefreshScheduler
 } from '../../scripts/quota_estimator.mjs';
 import {
+  getCachedUpdateStatus,
+  checkForPluginUpdate,
+  startUpdateCheckScheduler
+} from '../../scripts/update_checker.mjs';
+import {
   PLUGIN_DATA_DIR,
   BADGE_PORT,
   getConversationModelsFromDb,
@@ -111,7 +116,7 @@ function resolveTargetConversation(url, recent = null) {
 async function handleRequest(req, res) {
   const url = new URL(req.url || '/', `http://127.0.0.1:${port}`);
 
-  if (['/api/prompt-profiles', '/api/prompt-sources', '/api/runtime-state', '/api/native-prompts', '/api/fork-turn', '/api/quota-sample', '/api/quota-stats', '/api/quota-refresh'].includes(url.pathname)) {
+  if (['/api/prompt-profiles', '/api/prompt-sources', '/api/runtime-state', '/api/native-prompts', '/api/fork-turn', '/api/quota-sample', '/api/quota-stats', '/api/quota-refresh', '/api/update-check'].includes(url.pathname)) {
     const origin = req.headers.origin;
     const host = req.headers.host || '';
     const pluginOrigin = /^plugin:\/\/agy-model-inspector--panel-(\d+)$/.exec(origin || '');
@@ -121,6 +126,21 @@ async function handleRequest(req, res) {
     if (!/^(127\.0\.0\.1|localhost):\d+$/.test(host) || (!samePlugin && !allowQuotaLoopback && (req.headers['sec-fetch-site'] === 'cross-site' ||
         (origin && origin !== `http://${host}`)))) {
       res.writeHead(403); res.end('Forbidden origin'); return;
+    }
+    if (url.pathname === '/api/update-check') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      try {
+        const force = req.method === 'POST' || url.searchParams.get('force') === '1' || url.searchParams.get('force') === 'true';
+        const status = force
+          ? await checkForPluginUpdate({ force: true })
+          : (getCachedUpdateStatus().checkedAtMs ? getCachedUpdateStatus() : await checkForPluginUpdate({ force: false }));
+        res.end(JSON.stringify({ ok: Boolean(status?.ok), updateStatus: status }));
+      } catch (err) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ ok: false, error: String(err?.message || err), updateStatus: getCachedUpdateStatus() }));
+      }
+      return;
     }
     if (url.pathname === '/api/quota-refresh') {
       if (req.method === 'OPTIONS') {
@@ -496,7 +516,30 @@ async function handleRequest(req, res) {
       sendJson(res, 200, { ok: true, value: handleDshPage(body, cfg) });
       return;
     }
-    if (['recom', 'version', 'balance', 'backfill', 'attachment', 'delta', 'snapshot', 'pricing-refresh', 'update-check'].includes(endpoint)) {
+    if (endpoint === 'update-check') {
+      const status = await checkForPluginUpdate({ force: Boolean(body?.force) });
+      sendJson(res, 200, { ok: true, value: status });
+      return;
+    }
+    if (endpoint === 'version') {
+      const cached = getCachedUpdateStatus();
+      const status = cached.checkedAtMs > 0 ? cached : await checkForPluginUpdate({ force: false });
+      const ready = Boolean(status.checkedAtMs > 0 || status.latestVersion || status.error);
+      const failed = Boolean(!status.ok && !status.latestVersion);
+      sendJson(res, 200, {
+        ok: true,
+        value: {
+          ready,
+          failed,
+          checkedAt: Number(status.checkedAtMs || status.lastAttemptAtMs || Date.now()),
+          current: status.currentVersion || null,
+          ...(status.latestVersion ? { latest: status.latestVersion } : {}),
+          updateAvailable: Boolean(status.hasUpdate)
+        }
+      });
+      return;
+    }
+    if (['recom', 'balance', 'backfill', 'attachment', 'delta', 'snapshot', 'pricing-refresh'].includes(endpoint)) {
       sendJson(res, 200, { ok: true, value: null });
       return;
     }
@@ -536,6 +579,7 @@ server.on('error', (err) => {
 server.listen(port, '127.0.0.1', () => {
   console.log(`[agy-model-inspector] Sidecar UI listening on http://127.0.0.1:${port}`);
   startQuotaAutoRefreshScheduler();
+  startUpdateCheckScheduler();
   if (process.env.AGY_DISABLE_RUNTIME_INJECTOR !== '1') {
     const child = spawn(process.execPath, ['--no-warnings', path.resolve(__dirname, '../../scripts/runtime-injector.mjs')], {
       detached: true, windowsHide: true, stdio: 'ignore', env: process.env
