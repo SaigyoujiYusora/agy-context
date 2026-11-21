@@ -190,9 +190,18 @@ jobs:
           if ($LASTEXITCODE -eq 0) { $exists = $true }
 
           if ($exists) {
-            Write-Host "Release $tag already exists; uploading/replacing assets..."
+            Write-Host "Release $tag already exists (or is draft); uploading assets and publishing..."
             gh release upload $tag @assets --clobber
             if ($LASTEXITCODE -ne 0) { throw "gh release upload failed for $tag" }
+            $editArgs = @(
+              'release', 'edit', $tag,
+              '--draft=false',
+              '--title', "AGY Context $tag",
+              '--notes-file', $notesFile
+            )
+            if ($isPre) { $editArgs += '--prerelease=true' } else { $editArgs += '--prerelease=false' }
+            & gh @editArgs
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit failed for $tag" }
           } else {
             $args = @('release', 'create', $tag) + $assets + @(
               '--title', "AGY Context $tag",
