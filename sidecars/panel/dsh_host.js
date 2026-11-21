@@ -2185,7 +2185,7 @@
   // ── Plugin Version & Update Card (Settings Tab) ───────────────────────────
   function UpdateCard({ updateStatus, locale }) {
     const isEn = locale === 'en';
-    const curVer = updateStatus?.currentVersion || '1.2.2';
+    const curVer = updateStatus?.currentVersion || '1.3.0';
     const latestVer = updateStatus?.latestVersion || '';
     const hasUpdate = Boolean(updateStatus?.hasUpdate && latestVer);
     const errMsg = updateStatus?.error || '';
