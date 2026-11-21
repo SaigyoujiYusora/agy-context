@@ -342,6 +342,23 @@ export function decodeGeneratorMetadataBlob(rawBuf, rowIdx = 0) {
   return info;
 }
 
+export function normalizeModelForRouteCompare(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s || s === 'n/a' || s === 'unknown') return '';
+  return s
+    .replace(/^models\//, '')
+    .replace(/-(xhigh|high|medium|med|low|minimal|thinking|none)$/i, '')
+    .replace(/@.*$/, '')
+    .trim();
+}
+
+export function isModelRouteMismatch(sentModel, responseModel) {
+  const a = normalizeModelForRouteCompare(sentModel);
+  const b = normalizeModelForRouteCompare(responseModel);
+  if (!a || !b) return false;
+  return a !== b;
+}
+
 export function formatActualModelTag(inv) {
   if (!inv) return 'unknown';
   const sent = String(inv.sentModel || '').trim();
@@ -761,7 +778,7 @@ export function buildConversationSummary(conversationId, title, updatedAtMs, inv
       responseModel: latestResp,
       responseModelFull: latest.responseModelFull || '',
       actualModelLabel: formatActualModelTag(latest),
-      modelMismatch: Boolean(latest.sentModel && latestResp && latestResp !== 'N/A' && latest.sentModel.toLowerCase() !== latestResp.toLowerCase()),
+      modelMismatch: isModelRouteMismatch(latest.sentModel, latestResp),
       modelDisplayName: latest.modelDisplayName || 'N/A',
       modelEnum: latest.modelEnum || 'N/A',
       apiProvider: latest.apiProvider || 'N/A',
@@ -2636,9 +2653,7 @@ export function queryConversationInvocations(conversationId, options = {}) {
   const totalUnfiltered = rows.length;
   let filtered = rows;
   if (onlyMismatch) {
-    filtered = filtered.filter(r =>
-      Boolean(r.sentModel && r.responseModel && r.sentModel.toLowerCase() !== r.responseModel.toLowerCase())
-    );
+    filtered = filtered.filter(r => isModelRouteMismatch(r.sentModel, r.responseModelFull || r.responseModel));
   }
   if (search) {
     filtered = filtered.filter(r =>

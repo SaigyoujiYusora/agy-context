@@ -13,6 +13,33 @@
   });
 
   // ── Formatters & Dual-Layer Helpers ───────────────────────────────────────
+  function isModelRouteMismatch(sentModel, responseModel) {
+    const norm = (raw) => {
+      const s = String(raw || '').trim().toLowerCase();
+      if (!s || s === 'n/a' || s === 'unknown') return '';
+      return s
+        .replace(/^models\//, '')
+        .replace(/-(xhigh|high|medium|med|low|minimal|thinking|none)$/i, '')
+        .replace(/@.*$/, '')
+        .trim();
+    };
+    const a = norm(sentModel);
+    const b = norm(responseModel);
+    return Boolean(a && b && a !== b);
+  }
+
+  function parseModelAndEffort(sentModel, responseModel) {
+    const rawSent = String(sentModel || '').trim();
+    const rawResp = String(responseModel || '').trim();
+    const effortRe = /-(xhigh|high|medium|med|low|minimal|thinking|none)$/i;
+    const mSent = rawSent.match(effortRe);
+    const mResp = rawResp.match(effortRe);
+    const effort = (mSent?.[1] || mResp?.[1] || '').toLowerCase();
+    const primary = rawResp && rawResp !== 'N/A' ? rawResp : rawSent;
+    const base = primary.replace(effortRe, '') || rawSent || 'N/A';
+    return { base, effort };
+  }
+
   function fmtInt(n) {
     return Math.round(Number(n || 0)).toLocaleString('en-US');
   }
@@ -1524,8 +1551,7 @@
                     h('tr', null,
                       h('th', null, data.hasSubagents ? '# / Agent' : '#'),
                       h('th', { className: 'agy-col-step' }, 'Step'),
-                      h('th', null, '发往上游 sentModel'),
-                      h('th', null, 'SSE 返回 responseModel'),
+                      h('th', null, '模型'),
                       h('th', null, 'TTFT / 流式'),
                       h('th', null, isE2e ? '含TTFT TPS' : '纯Decode TPS'),
                       h('th', null, '输入 (未缓存 / 缓存)'),
@@ -1537,7 +1563,7 @@
                     data.items.map((inv, i) => {
                       const sent = inv.sentModel || 'N/A';
                       const resp = inv.responseModelFull || inv.responseModel || 'N/A';
-                      const mismatch = Boolean(inv.sentModel && inv.responseModel && inv.sentModel.toLowerCase() !== inv.responseModel.toLowerCase());
+                      const mismatch = isModelRouteMismatch(inv.sentModel, inv.responseModelFull || inv.responseModel);
                       const tpsVal = isE2e ? Number(inv.e2eTps || 0) : Number(inv.tps || 0);
                       const isApprox = !isE2e && Boolean(inv.tpsApprox);
                       const timeStr = fmtClockHms(inv.timestampMs);
@@ -1568,14 +1594,40 @@
                         h('td', { className: 'mono agy-col-step' },
                           h('span', { className: 'agy-step-text', title: stepInfo.title }, stepInfo.text)
                         ),
-                        h('td', { className: 'mono' },
-                          h('span', { className: 'agy-model-chip' }, sent),
-                          inv.modelDisplayName ? h('div', { className: 'agy-sub-label' }, inv.modelDisplayName) : null
-                        ),
-                        h('td', { className: 'mono' },
-                          h('span', { className: `agy-model-chip${mismatch ? ' is-warn' : ' is-match'}` }, resp),
-                          mismatch ? h('div', { className: 'agy-sub-label warn' }, '路由映射不一致') : null
-                        ),
+                        (() => {
+                          const { base, effort } = parseModelAndEffort(sent, resp);
+                          const routeTip = [
+                            inv.modelDisplayName ? `显示名: ${inv.modelDisplayName}` : '',
+                            `发往上游: ${sent}`,
+                            `SSE 返回: ${resp}`,
+                            effort ? `思考强度: ${effort}` : '',
+                            inv.modelEnum ? `枚举: ${inv.modelEnum}` : ''
+                          ].filter(Boolean).join('\n');
+                          return h('td', { className: 'mono agy-col-route' },
+                            h('div', { className: 'agy-route-stack', title: routeTip },
+                              mismatch
+                                ? [
+                                    h('span', { key: 's', className: 'agy-route-sent' }, sent),
+                                    h('span', { key: 'r', className: 'agy-route-resp-line' },
+                                      h('span', { className: 'agy-route-branch', 'aria-hidden': 'true' }, '↳'),
+                                      h('span', { className: 'agy-route-resp-chip is-warn' },
+                                        resp,
+                                        h('span', { className: 'agy-route-warn-tag' }, ' · 不一致')
+                                      )
+                                    )
+                                  ]
+                                : [
+                                    h('span', { key: 'b', className: 'agy-route-resp-chip is-match' }, base),
+                                    effort
+                                      ? h('span', { key: 'e', className: 'agy-route-resp-line' },
+                                          h('span', { className: 'agy-route-branch', 'aria-hidden': 'true' }, '↳'),
+                                          h('span', { className: 'agy-route-effort' }, effort)
+                                        )
+                                      : null
+                                  ]
+                            )
+                          );
+                        })(),
                         h('td', { className: 'mono' },
                           h('div', null, `${Number(inv.ttftSeconds || 0).toFixed(2)}s TTFT`),
                           h('div', { className: 'agy-sub-label' }, `${Number(inv.streamingSeconds || 0).toFixed(2)}s decode`)
@@ -1686,7 +1738,7 @@
 
     const sentModel = lm?.sentModel || lm?.actualModelLabel || 'N/A';
     const respModel = lm?.responseModel || 'N/A';
-    const mismatch = Boolean(lm?.modelMismatch);
+    const mismatch = isModelRouteMismatch(lm?.sentModel, lm?.responseModelFull || lm?.responseModel);
 
     const shownTps = isE2e ? Number(tot.avgE2eTps || 0) : Number(tot.avgTps || 0);
     const tpsApprox = !isE2e && Boolean(tot.avgTpsApprox);
@@ -1716,20 +1768,42 @@
       notifyStore();
     };
 
+    const modelProbe = `${sentModel} ${respModel} ${lm?.modelDisplayName || ''} ${lm?.apiProvider || ''}`.toLowerCase();
+    const modelBrand = /claude|anthropic/.test(modelProbe)
+      ? 'claude'
+      : /gpt|openai/.test(modelProbe)
+        ? 'openai'
+        : 'gemini';
+    const renderModelBrandSvg = () => {
+      if (modelBrand === 'claude') {
+        return h('svg', { width: 15, height: 15, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', 'aria-hidden': 'true' },
+          h('path', { d: 'M8 2v12M2.8 5l10.4 6M13.2 5L2.8 11' })
+        );
+      }
+      if (modelBrand === 'openai') {
+        return h('svg', { width: 15, height: 15, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.35, strokeLinejoin: 'round', 'aria-hidden': 'true' },
+          h('polygon', { points: '8,1.8 13.4,4.9 13.4,11.1 8,14.2 2.6,11.1 2.6,4.9' }),
+          h('circle', { cx: 8, cy: 8, r: 2.1 })
+        );
+      }
+      return h('svg', { width: 15, height: 15, viewBox: '0 0 16 16', fill: 'currentColor', 'aria-hidden': 'true' },
+        h('path', { d: 'M8 1.2C8.35 5.1 10.9 7.65 14.8 8C10.9 8.35 8.35 10.9 8 14.8C7.65 10.9 5.1 8.35 1.2 8C5.1 7.65 7.65 5.1 8 1.2Z' })
+      );
+    };
+    const modelLogoTitle = [
+      `模型: ${sentModel !== 'N/A' ? sentModel : respModel}`,
+      mismatch ? `⚠ 路由不一致: ${sentModel} → ${respModel}` : (respModel !== 'N/A' ? `SSE 返回: ${respModel}` : ''),
+      lm?.modelDisplayName && lm.modelDisplayName !== 'N/A' ? `显示名: ${lm.modelDisplayName}` : '',
+      lm?.modelEnum && lm.modelEnum !== 'N/A' ? `枚举: ${lm.modelEnum}` : ''
+    ].filter(Boolean).join('\n');
+
     return h('div', { className: 'dsh-composer-bar', onClick: (e) => e.stopPropagation() },
       h('div', { className: 'dsh-pills-left' },
-        h('span', { className: 'dsh-composer-plus', 'aria-hidden': 'true' },
-          h(getIcon('IconPlusOutlineRegular'), { size: 15 })
-        ),
         h('span', {
-          className: `dsh-pill dsh-pill-model${mismatch ? ' is-warn' : ''}`,
-          title: `显示名称: ${lm?.modelDisplayName || 'N/A'} (${lm?.modelEnum || 'N/A'})`
-        },
-          h('span', { className: 'dsh-spark' }, '✦'),
-          h('span', { className: 'dsh-model-route' },
-            mismatch ? `${sentModel} → ${respModel}` : respModel
-          )
-        )
+          className: `dsh-model-logo is-${modelBrand}${mismatch ? ' is-warn' : ''}`,
+          title: modelLogoTitle,
+          'aria-label': sentModel !== 'N/A' ? sentModel : respModel
+        }, renderModelBrandSvg())
       ),
       h('div', { className: 'dsh-pills-right' },
         // Pill 1: TPS + Upward Session Stats Popover

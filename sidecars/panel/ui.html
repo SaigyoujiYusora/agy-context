@@ -554,8 +554,8 @@
       display: flex;
       flex-wrap: wrap;
       align-items: center;
-      justify-content: space-between;
-      gap: 10px;
+      justify-content: flex-start;
+      gap: 8px;
       padding: 7px 16px;
       background: var(--agy-composer-bg);
       border-top: 1px solid var(--dsw-alias-border-l2);
@@ -568,15 +568,31 @@
       align-items: center;
       gap: 8px;
     }
-    .dsh-composer-plus {
+    .dsh-model-logo {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 26px;
-      height: 26px;
-      color: var(--dsw-alias-label-secondary);
-      border-radius: 6px;
+      width: 28px;
+      height: 28px;
+      border-radius: 999px;
+      background: var(--agy-pill-bg);
+      border: 1px solid var(--dsw-alias-border-l2);
+      flex: none;
+      transition: background-color 0.14s ease, border-color 0.14s ease;
     }
+    .dsh-model-logo svg { display: block; }
+    .dsh-model-logo.is-gemini { color: #818cf8; }
+    .dsh-model-logo.is-claude { color: #e08b6a; }
+    .dsh-model-logo.is-openai { color: #34d399; }
+    body:not([data-ds-dark-theme]) .dsh-model-logo.is-gemini { color: #4f46e5; }
+    body:not([data-ds-dark-theme]) .dsh-model-logo.is-claude { color: #c25e3c; }
+    body:not([data-ds-dark-theme]) .dsh-model-logo.is-openai { color: #059669; }
+    .dsh-model-logo.is-warn {
+      background: rgba(245, 158, 11, 0.14);
+      border-color: rgba(245, 158, 11, 0.50);
+      color: #f59e0b;
+    }
+    body[data-ds-dark-theme] .dsh-model-logo.is-warn { color: #fde68a; }
     .dsh-pill-anchor { position: relative; }
 
     .dsh-pill {
@@ -997,9 +1013,11 @@
     }
     .agy-dual-tok { display: flex; flex-direction: column; line-height: 1.25; }
     .agy-dual-head {
-      display: inline-flex;
-      align-items: baseline;
-      gap: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      width: 100%;
       flex-wrap: nowrap;
       white-space: nowrap;
     }
@@ -1008,9 +1026,12 @@
       font-weight: 600;
       font-family: var(--font-mono);
       font-variant-numeric: tabular-nums;
+      min-width: 50px;
+      text-align: center;
       padding: 1px 5px;
       border-radius: 5px;
       line-height: 1.3;
+      flex: none;
     }
     .agy-cache-pct.is-high {
       color: #34d399;
@@ -1138,6 +1159,7 @@
       background: var(--dsw-alias-bg-layer-2);
       border: 1px solid var(--dsw-alias-border-l2);
       font-size: 11.5px;
+      white-space: nowrap;
     }
     .agy-model-chip.is-match {
       border-color: rgba(34, 197, 94, 0.45);
@@ -1149,7 +1171,104 @@
       color: #b45309;
     }
     body[data-ds-dark-theme] .agy-model-chip.is-warn { color: #fde047; }
-    .agy-sub-label { font-size: 10.5px; color: var(--dsw-alias-label-tertiary); margin-top: 2px; }
+    .agy-col-route { white-space: nowrap; }
+    .agy-route-stack {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 3px;
+      white-space: nowrap;
+    }
+    .agy-route-sent {
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--dsw-alias-label-primary);
+      line-height: 1.25;
+      white-space: nowrap;
+    }
+    .agy-route-resp-line {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+    .agy-route-branch {
+      color: var(--dsw-alias-label-tertiary);
+      font-size: 11px;
+      user-select: none;
+    }
+    .agy-route-resp-chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 11px;
+      line-height: 1.3;
+      white-space: nowrap;
+    }
+    .agy-route-resp-chip.is-match {
+      color: #15803d;
+      background: rgba(34, 197, 94, 0.10);
+      border: 1px solid rgba(34, 197, 94, 0.34);
+    }
+    body[data-ds-dark-theme] .agy-route-resp-chip.is-match { color: #86efac; }
+    .agy-route-resp-chip.is-warn {
+      color: #b45309;
+      background: rgba(245, 158, 11, 0.15);
+      border: 1px solid rgba(245, 158, 11, 0.50);
+    }
+    body[data-ds-dark-theme] .agy-route-resp-chip.is-warn { color: #fde047; }
+    .agy-route-warn-tag {
+      font-family: var(--font-sans);
+      font-size: 10px;
+      opacity: 0.9;
+    }
+    .agy-route-effort {
+      font-size: 10.5px;
+      font-weight: 500;
+      color: var(--dsw-alias-label-secondary);
+      padding: 0 5px;
+      border-radius: 4px;
+      background: var(--dsw-alias-bg-layer-2);
+      border: 1px solid var(--dsw-alias-border-l2);
+      line-height: 1.45;
+      white-space: nowrap;
+    }
+    .agy-seg-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      padding: 2px;
+      border-radius: 7px;
+      background: var(--dsw-alias-bg-layer-2);
+      border: 1px solid var(--dsw-alias-border-l2);
+    }
+    .agy-seg-btn {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: var(--dsw-alias-label-secondary);
+      font-size: 12px;
+      font-weight: 500;
+      font-family: inherit;
+      padding: 3px 9px;
+      border-radius: 5px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background-color 0.14s ease, color 0.14s ease;
+    }
+    .agy-seg-btn:hover:not(.is-on) {
+      background: var(--dsw-alias-interactive-bg-hover);
+      color: var(--dsw-alias-label-primary);
+    }
+    .agy-seg-btn.is-on {
+      background: var(--dsw-alias-brand-primary);
+      color: #ffffff;
+      font-weight: 600;
+    }
+    .agy-sub-label { font-size: 10.5px; color: var(--dsw-alias-label-tertiary); margin-top: 2px; white-space: nowrap; }
     .agy-sub-label.warn { color: #d97706; }
     body[data-ds-dark-theme] .agy-sub-label.warn { color: #fbbf24; }
     .agy-tps-approx {
@@ -1338,7 +1457,7 @@
   <div id="app-root"></div>
   <script src="/vendor/react.production.min.js"></script>
   <script src="/vendor/react-dom.production.min.js"></script>
-  <script src="/dsh_host.js?v=1.2.9"></script>
+  <script src="/dsh_host.js?v=1.2.13"></script>
   <script src="/vendor/dsh-context-client.js?v=1.2.4"></script>
   <script>if (window.__AGY_DSH_HOST__) window.__AGY_DSH_HOST__.initHost();</script>
 </body>
