@@ -1284,6 +1284,34 @@
     .agy-tps-ok { font-weight: 600; color: #16a34a; }
     body[data-ds-dark-theme] .agy-tps-ok { color: #4ade80; }
     .agy-col-seq { white-space: nowrap; width: 1%; }
+    .agy-col-seq.has-time { cursor: default; }
+    .agy-time-float {
+      position: fixed;
+      transform: translateY(-50%);
+      z-index: 9999;
+      pointer-events: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 10px;
+      border-radius: 8px;
+      background: var(--agy-popover-bg);
+      border: 1px solid var(--dsw-alias-border-l1);
+      box-shadow: var(--dsw-shadow-lv3);
+      color: var(--dsw-alias-label-primary);
+      font-size: 12px;
+      line-height: 1.2;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .agy-time-float-seq {
+      color: var(--dsw-alias-label-tertiary);
+      font-size: 11px;
+    }
+    .agy-time-float-val {
+      color: var(--dsw-alias-label-primary);
+      font-weight: 600;
+    }
     .agy-col-step { white-space: nowrap; width: 1%; }
     .agy-step-text {
       display: inline-block;
@@ -1457,7 +1485,7 @@
   <div id="app-root"></div>
   <script src="/vendor/react.production.min.js"></script>
   <script src="/vendor/react-dom.production.min.js"></script>
-  <script src="/dsh_host.js?v=1.2.14"></script>
+  <script src="/dsh_host.js?v=1.2.15"></script>
   <script src="/vendor/dsh-context-client.js?v=1.2.6"></script>
   <script>if (window.__AGY_DSH_HOST__) window.__AGY_DSH_HOST__.initHost();</script>
 </body>

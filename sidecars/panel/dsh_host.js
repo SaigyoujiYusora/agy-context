@@ -76,6 +76,19 @@
     return `${hh}:${mm}:${ss}`;
   }
 
+  function fmtFullDateTime(ms) {
+    const n = Number(ms || 0);
+    if (!Number.isFinite(n) || n <= 0) return '';
+    const d = new Date(n);
+    const yyyy = d.getFullYear();
+    const mo = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    return `${yyyy}-${mo}-${dd} ${hh}:${mm}:${ss}`;
+  }
+
   function buildPagerItems(page, totalPages) {
     const total = Math.max(1, Number(totalPages || 1));
     const cur = Math.min(total, Math.max(1, Number(page || 1)));
@@ -1207,6 +1220,22 @@
     const [loading, setLoading] = React.useState(false);
     const [loadingMore, setLoadingMore] = React.useState(false);
     const [error, setError] = React.useState('');
+    const [hoverTimeTip, setHoverTimeTip] = React.useState(null);
+
+    React.useEffect(() => {
+      setHoverTimeTip(null);
+    }, [conversationId, page, scope, mode, debouncedSearch, onlyMismatch, pageSize, refreshNonce]);
+
+    React.useEffect(() => {
+      if (!hoverTimeTip) return undefined;
+      const clearTip = () => setHoverTimeTip(null);
+      window.addEventListener('scroll', clearTip, true);
+      window.addEventListener('resize', clearTip);
+      return () => {
+        window.removeEventListener('scroll', clearTip, true);
+        window.removeEventListener('resize', clearTip);
+      };
+    }, [Boolean(hoverTimeTip)]);
 
     const panelRef = React.useRef(null);
     const sentinelRef = React.useRef(null);
@@ -1570,11 +1599,27 @@
                       const tpsVal = isE2e ? Number(inv.e2eTps || 0) : Number(inv.tps || 0);
                       const isApprox = !isE2e && Boolean(inv.tpsApprox);
                       const timeStr = fmtClockHms(inv.timestampMs);
+                      const fullTimeStr = fmtFullDateTime(inv.timestampMs);
+                      const seqLabel = `#${inv.seqNum || (i + 1)}`;
                       const isFocusedAgent = Boolean(inv.agentId && scope === `agent:${inv.agentId}`);
                       const hue = AGENT_FLEET_HUES[(Number(inv.agentHueIndex) || 0) % AGENT_FLEET_HUES.length];
                       const stepInfo = formatStepRange(inv.stepIndices, inv.lastStepIndex);
                       return h('tr', { key: `${inv.agentId || 'self'}-${inv.seqNum || i}-${inv.requestId || i}` },
-                        h('td', { className: 'mono dim agy-col-seq' },
+                        h('td', {
+                          className: `mono dim agy-col-seq${fullTimeStr ? ' has-time' : ''}`,
+                          onMouseEnter: fullTimeStr
+                            ? (e) => {
+                                const rect = e.currentTarget.getBoundingClientRect();
+                                setHoverTimeTip({
+                                  seq: seqLabel,
+                                  fullTime: fullTimeStr,
+                                  left: Math.max(8, Math.min(window.innerWidth - 220, Math.round(rect.right + 8))),
+                                  top: Math.max(22, Math.min(window.innerHeight - 22, Math.round(rect.top + rect.height / 2)))
+                                });
+                              }
+                            : undefined,
+                          onMouseLeave: fullTimeStr ? () => setHoverTimeTip(null) : undefined
+                        },
                           data.hasSubagents
                             ? h('div', { className: 'agy-seq-agent-row' },
                                 h('button', {
@@ -1589,9 +1634,9 @@
                                     setPage(1);
                                   }
                                 }, inv.agentBadge || '主'),
-                                h('span', null, `#${inv.seqNum || (i + 1)}`)
+                                h('span', null, seqLabel)
                               )
-                            : h('div', null, `#${inv.seqNum || (i + 1)}`),
+                            : h('div', null, seqLabel),
                           timeStr ? h('div', { className: 'agy-sub-label' }, timeStr) : null
                         ),
                         h('td', { className: 'mono agy-col-step' },
@@ -1725,7 +1770,29 @@
             [20, 50, 100, 200].map(n => h('option', { key: n, value: String(n) }, `${n} 条`))
           )
         )
-      )
+      ),
+      hoverTimeTip
+        ? (ReactDOM?.createPortal
+            ? ReactDOM.createPortal(
+                h('div', {
+                  className: 'agy-time-float',
+                  role: 'tooltip',
+                  style: { left: `${hoverTimeTip.left}px`, top: `${hoverTimeTip.top}px` }
+                },
+                  h('span', { className: 'agy-time-float-seq mono' }, hoverTimeTip.seq),
+                  h('span', { className: 'agy-time-float-val mono' }, hoverTimeTip.fullTime)
+                ),
+                document.body
+              )
+            : h('div', {
+                className: 'agy-time-float',
+                role: 'tooltip',
+                style: { left: `${hoverTimeTip.left}px`, top: `${hoverTimeTip.top}px` }
+              },
+                h('span', { className: 'agy-time-float-seq mono' }, hoverTimeTip.seq),
+                h('span', { className: 'agy-time-float-val mono' }, hoverTimeTip.fullTime)
+              ))
+        : null
     );
   }
 
