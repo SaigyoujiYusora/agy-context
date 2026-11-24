@@ -46,7 +46,8 @@
 
   const OVERLAY_FILE = path.resolve(__dirname, '..', 'sidecars', 'panel', 'runtime-overlay.js');
   const API_PORT = Math.max(1024, Math.min(65535, Number(process.env.AGY_INSPECTOR_API_PORT || 18922)));
-  const POLL_MS = Math.max(500, Number(process.env.AGY_RUNTIME_POLL_MS || 1500));
+  const POLL_MS = Math.max(500, Number(process.env.AGY_RUNTIME_POLL_MS || 2500));
+  const OVERLAY_STAT_TTL_MS = 10000;
   const STATUS_FILE = path.join(
     process.env.ANTIGRAVITY_APP_DATA_DIR || path.join(process.env.USERPROFILE || process.env.HOME || '', '.gemini', 'antigravity'),
     'plugin_data',
@@ -66,18 +67,25 @@
   }
   writeStatus({ stage: 'loaded' });
 
-  let cachedOverlay = { mtimeMs: -1, source: '', version: 'runtime-overlay-v22' };
+  let cachedOverlay = { mtimeMs: -1, checkedAt: 0, source: '', version: 'runtime-overlay-v22' };
 
   function getOverlayBundle() {
+    const now = Date.now();
+    if (cachedOverlay.source && (now - cachedOverlay.checkedAt) < OVERLAY_STAT_TTL_MS) {
+      return cachedOverlay;
+    }
     const st = fs.statSync(OVERLAY_FILE);
     if (cachedOverlay.mtimeMs !== st.mtimeMs || !cachedOverlay.source) {
       const source = fs.readFileSync(OVERLAY_FILE, 'utf8');
       const m = source.match(/const\s+VERSION\s*=\s*['"]([^'"]+)['"]/);
       cachedOverlay = {
         mtimeMs: st.mtimeMs,
+        checkedAt: now,
         source,
         version: m ? m[1] : 'runtime-overlay-v22'
       };
+    } else {
+      cachedOverlay.checkedAt = now;
     }
     return cachedOverlay;
   }
@@ -231,6 +239,81 @@
 
   const hookedWebContents = new WeakSet();
   const hookedApps = new WeakSet();
+  const windowWakeRegistry = new WeakMap();
+  const windowWakeDispatchers = new WeakMap();
+  let BrowserWindowApi = null;
+
+  function registerWindowWake(win, fn) {
+    if (!win || win.isDestroyed?.()) return;
+    let callbacks = windowWakeRegistry.get(win);
+    if (!callbacks) {
+      callbacks = new Set();
+      windowWakeRegistry.set(win, callbacks);
+      const dispatch = () => {
+        for (const cb of Array.from(callbacks)) {
+          try {
+            cb();
+          } catch {}
+        }
+      };
+      windowWakeDispatchers.set(win, dispatch);
+      win.on?.('show', dispatch);
+      win.on?.('restore', dispatch);
+      win.on?.('focus', dispatch);
+    }
+    callbacks.add(fn);
+  }
+
+  function unregisterWindowWake(win, fn) {
+    if (!win) return;
+    const callbacks = windowWakeRegistry.get(win);
+    if (!callbacks) return;
+    callbacks.delete(fn);
+    if (callbacks.size === 0) {
+      windowWakeRegistry.delete(win);
+      const dispatch = windowWakeDispatchers.get(win);
+      windowWakeDispatchers.delete(win);
+      if (dispatch && !win.isDestroyed?.()) {
+        win.off?.('show', dispatch);
+        win.off?.('restore', dispatch);
+        win.off?.('focus', dispatch);
+      }
+    }
+  }
+
+  function resolveHostWindow(wc) {
+    try {
+      if (!wc || wc.isDestroyed?.()) return null;
+      if (BrowserWindowApi && typeof BrowserWindowApi.fromWebContents === 'function') {
+        const direct = BrowserWindowApi.fromWebContents(wc);
+        if (direct && !direct.isDestroyed?.()) return direct;
+      }
+      if (BrowserWindowApi && typeof BrowserWindowApi.getAllWindows === 'function') {
+        for (const win of BrowserWindowApi.getAllWindows()) {
+          if (!win || win.isDestroyed?.()) continue;
+          if (win.webContents === wc) return win;
+          const children = win.contentView?.children;
+          if (Array.isArray(children) && children.some((v) => v && v.webContents === wc)) {
+            return win;
+          }
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  function isWebContentsVisible(wc) {
+    try {
+      if (!wc || wc.isDestroyed?.()) return false;
+      const win = resolveHostWindow(wc);
+      if (!win) return true;
+      if (typeof win.isVisible === 'function' && !win.isVisible()) return false;
+      if (typeof win.isMinimized === 'function' && win.isMinimized()) return false;
+      return true;
+    } catch {
+      return true;
+    }
+  }
 
   function hookWebContents(wc) {
     if (!wc || typeof wc !== 'object' || hookedWebContents.has(wc)) return;
@@ -243,7 +326,8 @@
       overlayRevision: -1,
       lastRevision: '',
       busy: false,
-      timer: null
+      timer: null,
+      boundWin: null
     };
 
     async function syncOnce() {
@@ -302,14 +386,44 @@
       }
     }
 
+    const onWindowWake = () => {
+      if (wc.isDestroyed?.()) {
+        unbindHostWindowWake();
+        return;
+      }
+      if (extractConversationId(wc.getURL?.() || '') && isWebContentsVisible(wc)) {
+        void syncOnce();
+      }
+    };
+
+    function unbindHostWindowWake() {
+      if (state.boundWin) {
+        unregisterWindowWake(state.boundWin, onWindowWake);
+        state.boundWin = null;
+      }
+    }
+
+    function bindHostWindowWake() {
+      const win = resolveHostWindow(wc);
+      if (state.boundWin === win) return;
+      unbindHostWindowWake();
+      if (!win) return;
+      state.boundWin = win;
+      registerWindowWake(win, onWindowWake);
+    }
+
     function ensureTimer() {
+      bindHostWindowWake();
       if (state.timer || wc.isDestroyed?.()) return;
       state.timer = setInterval(() => {
         if (wc.isDestroyed?.()) {
           clearInterval(state.timer);
           state.timer = null;
+          unbindHostWindowWake();
           return;
         }
+        bindHostWindowWake();
+        if (!isWebContentsVisible(wc)) return;
         if (extractConversationId(wc.getURL?.() || '')) {
           void syncOnce();
         }
@@ -325,7 +439,9 @@
       }
       if (extractConversationId(url)) {
         ensureTimer();
-        void syncOnce();
+        if (isWebContentsVisible(wc)) {
+          void syncOnce();
+        }
       }
     }
 
@@ -338,15 +454,19 @@
         clearInterval(state.timer);
         state.timer = null;
       }
+      unbindHostWindowWake();
     });
 
     if (extractConversationId(wc.getURL?.() || '') && !wc.isLoadingMainFrame?.()) {
       ensureTimer();
-      void syncOnce();
+      if (isWebContentsVisible(wc)) {
+        void syncOnce();
+      }
     }
   }
 
-  function attachAll(app, webContentsApi) {
+  function attachAll(app, webContentsApi, browserWindowApi) {
+    if (browserWindowApi) BrowserWindowApi = browserWindowApi;
     if (app && !hookedApps.has(app)) {
       hookedApps.add(app);
       app.on?.('web-contents-created', (_ev, wc) => {
@@ -366,9 +486,9 @@
     if (!electronMod || typeof electronMod !== 'object' || !electronMod.app) return false;
     globalThis.__AGY_CONTEXT_ELECTRON_ATTACHED__ = true;
 
-    attachAll(electronMod.app, electronMod.webContents);
+    attachAll(electronMod.app, electronMod.webContents, electronMod.BrowserWindow);
     void electronMod.app.whenReady().then(() => {
-      attachAll(electronMod.app, electronMod.webContents);
+      attachAll(electronMod.app, electronMod.webContents, electronMod.BrowserWindow);
     });
     return true;
   }

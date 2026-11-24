@@ -10,10 +10,14 @@ import {
 } from './model_core.mjs';
 
 export const QUOTA_SAMPLES_FILE = path.join(PLUGIN_DATA_DIR, 'quota_samples.jsonl');
+export const QUOTA_DB_CACHE_FILE = path.join(PLUGIN_DATA_DIR, 'quota_db_cache.json');
 
 const FIVE_HOUR_MS = 5 * 3600 * 1000;
 const WEEKLY_MS = 7 * 24 * 3600 * 1000;
 const MAX_SAMPLES = 1000;
+const MAX_DB_CACHE_ENTRIES = 1000;
+const QUOTA_DB_CACHE_VERSION = 1;
+const SUMMARY_CACHE_TTL_MS = 10_000;
 const ACTIVE_REFRESH_MS = 5 * 60 * 1000;
 const IDLE_REFRESH_MIN_MS = 30 * 60 * 1000;
 const IDLE_REFRESH_MAX_MS = 60 * 60 * 1000;
@@ -21,6 +25,10 @@ const IDLE_REFRESH_MAX_MS = 60 * 60 * 1000;
 let cachedSamples = { stamp: '', rows: [] };
 let cachedSummary = { stamp: '', computedAtMs: 0, value: null };
 const dbInvocationsCache = new Map(); // conversationId -> { stamp, items }
+let diskCacheLoaded = false;
+let diskCacheDirty = false;
+let diskCacheNeedsImmediateFlush = false;
+let diskCacheSaveTimer = null;
 let rpcFetchInFlight = null;
 let schedulerState = {
   started: false,
@@ -161,16 +169,202 @@ export function recordQuotaSample(rawSample) {
   return { ok: true, stored: true, sampleCount: Math.min(nextRows.length, MAX_SAMPLES) };
 }
 
-function getCachedConversationInvocations(conversationId, fallbackUpdatedAtMs = 0) {
-  const dbPath = path.join(CONVERSATIONS_DIR, `${conversationId}.db`);
-  const walPath = `${dbPath}-wal`;
-  const stamp = `${getFileStamp(dbPath)}|${getFileStamp(walPath)}|${fallbackUpdatedAtMs}`;
-  const cached = dbInvocationsCache.get(conversationId);
-  if (cached && cached.stamp === stamp) return cached.items;
+const PRICING_SIG_PRE_PROMO_MS = Date.UTC(2026, 6, 1);
+const PRICING_SIG_POST_PROMO_MS = Date.UTC(2028, 0, 1);
 
-  const summary = getConversationModelsFromDb(conversationId);
+function getPricingSignature() {
+  const probe = (m, opts = {}) => {
+    const c = estimateInvocationCost(m, 1000, 2000, 4000, opts);
+    if (c && typeof c === 'object' && c.rate) {
+      return `${Number(c.rate.miss || 0)}/${Number(c.rate.hit || 0)}/${Number(c.rate.out || 0)}`;
+    }
+    return Number(typeof c === 'number' ? c : (c?.totalUsd ?? c?.usd ?? 0)).toFixed(6);
+  };
+  const probes = [
+    // GPT-OSS
+    ['gpt-oss-120b'],
+    ['gpt-oss-20b'],
+    ['gpt-oss'],
+    // Claude Opus / Sonnet / Haiku
+    ['claude-opus-5-5'],
+    ['claude-opus-4-6'],
+    ['claude-opus-4-1'],
+    ['claude-opus'],
+    ['claude-sonnet-5'],
+    ['claude-sonnet-4-6'],
+    ['claude-sonnet'],
+    ['claude-haiku-4-5'],
+    ['claude-haiku-5-5', { promptTokens: 10_000 }],
+    ['claude-haiku-5-5', { promptTokens: 200_000 }],
+    // Gemini 4 family (probe pre-, post-, and current-time promo boundaries)
+    ['gemini-4-neon'],
+    ['gemini-4-argon', { atMs: PRICING_SIG_PRE_PROMO_MS }],
+    ['gemini-4-argon', { atMs: PRICING_SIG_POST_PROMO_MS }],
+    ['gemini-4-carbon', { atMs: PRICING_SIG_PRE_PROMO_MS }],
+    ['gemini-4-carbon', { atMs: PRICING_SIG_POST_PROMO_MS }],
+    ['gemini-4-carbon'],
+    ['gemini-4-hydrogen'],
+    // Gemini Flash-Lite & Flash
+    ['gemini-2.5-flash-lite'],
+    ['gemini-flash-lite'],
+    ['gemini-2.5-flash'],
+    ['gemini-3.8-flash', { atMs: PRICING_SIG_PRE_PROMO_MS }],
+    ['gemini-3.8-flash', { atMs: PRICING_SIG_POST_PROMO_MS }],
+    ['gemini-3.8-flash'],
+    // Gemini Pro (short & long context, pre- & post-promo)
+    ['gemini-3.1-pro', { promptTokens: 10_000, atMs: PRICING_SIG_PRE_PROMO_MS }],
+    ['gemini-3.1-pro', { promptTokens: 10_000, atMs: PRICING_SIG_POST_PROMO_MS }],
+    ['gemini-3.1-pro', { promptTokens: 250_000 }],
+    ['gemini-2.5-pro', { promptTokens: 10_000 }],
+    ['gemini-2.5-pro', { promptTokens: 250_000 }],
+    ['gemini-pro', { atMs: PRICING_SIG_PRE_PROMO_MS }],
+    ['gemini-pro', { atMs: PRICING_SIG_POST_PROMO_MS }],
+    // Default fallback
+    ['unknown-model', { atMs: PRICING_SIG_PRE_PROMO_MS }],
+    ['unknown-model', { atMs: PRICING_SIG_POST_PROMO_MS }]
+  ];
+  return probes.map(([m, opts]) => probe(m, opts)).join('|');
+}
+
+function isValidCachedInvocation(it) {
+  return Boolean(
+    it &&
+    typeof it === 'object' &&
+    Number.isFinite(it.ts) && it.ts > 0 &&
+    (it.pool === 'gemini' || it.pool === 'claude_gpt') &&
+    typeof it.model === 'string' &&
+    Number.isFinite(it.inputTokens) &&
+    Number.isFinite(it.cacheReadTokens) &&
+    Number.isFinite(it.outputTokens) &&
+    Number.isFinite(it.thinkingTokens) &&
+    Number.isFinite(it.totalTokens) &&
+    Number.isFinite(it.usd)
+  );
+}
+
+function ensureDiskCacheLoaded() {
+  if (diskCacheLoaded) return;
+  diskCacheLoaded = true;
+  try {
+    if (!fs.existsSync(QUOTA_DB_CACHE_FILE)) {
+      diskCacheNeedsImmediateFlush = true;
+      return;
+    }
+    const raw = fs.readFileSync(QUOTA_DB_CACHE_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (
+      !parsed ||
+      parsed.version !== QUOTA_DB_CACHE_VERSION ||
+      parsed.pricingSig !== getPricingSignature() ||
+      !parsed.entries ||
+      typeof parsed.entries !== 'object' ||
+      Array.isArray(parsed.entries)
+    ) {
+      try { fs.unlinkSync(QUOTA_DB_CACHE_FILE); } catch {}
+      diskCacheNeedsImmediateFlush = true;
+      return;
+    }
+    let droppedInvalid = false;
+    for (const [cid, entry] of Object.entries(parsed.entries)) {
+      if (
+        !cid ||
+        !entry ||
+        typeof entry.stamp !== 'string' ||
+        !Array.isArray(entry.items) ||
+        !entry.items.every(isValidCachedInvocation)
+      ) {
+        droppedInvalid = true;
+        continue;
+      }
+      dbInvocationsCache.set(cid, { stamp: entry.stamp, items: entry.items });
+    }
+    if (droppedInvalid) {
+      diskCacheDirty = true;
+      diskCacheNeedsImmediateFlush = true;
+    }
+  } catch {
+    // Corrupted JSON or unreadable cache file: remove it and transparently rebuild from SQLite
+    dbInvocationsCache.clear();
+    try { fs.unlinkSync(QUOTA_DB_CACHE_FILE); } catch {}
+    diskCacheNeedsImmediateFlush = true;
+  }
+}
+
+function flushDiskCacheSync() {
+  if (!diskCacheDirty) return false;
+  const tmpPath = `${QUOTA_DB_CACHE_FILE}.${process.pid}.tmp`;
+  let renamed = false;
+  try {
+    ensurePluginDataDir();
+    while (dbInvocationsCache.size > MAX_DB_CACHE_ENTRIES) {
+      const oldestKey = dbInvocationsCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      dbInvocationsCache.delete(oldestKey);
+    }
+    const entries = {};
+    for (const [cid, entry] of dbInvocationsCache.entries()) {
+      entries[cid] = { stamp: entry.stamp, items: entry.items };
+    }
+    const payload = JSON.stringify({
+      version: QUOTA_DB_CACHE_VERSION,
+      pricingSig: getPricingSignature(),
+      entries
+    });
+    fs.writeFileSync(tmpPath, payload, 'utf8');
+    try {
+      fs.renameSync(tmpPath, QUOTA_DB_CACHE_FILE);
+      renamed = true;
+    } catch {
+      fs.writeFileSync(QUOTA_DB_CACHE_FILE, payload, 'utf8');
+    }
+    diskCacheDirty = false;
+    diskCacheNeedsImmediateFlush = false;
+    if (diskCacheSaveTimer) {
+      clearTimeout(diskCacheSaveTimer);
+      diskCacheSaveTimer = null;
+    }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (!renamed) {
+      try { fs.unlinkSync(tmpPath); } catch {}
+    }
+  }
+}
+
+function scheduleDiskCacheSave() {
+  if (!diskCacheDirty || diskCacheSaveTimer) return;
+  diskCacheSaveTimer = setTimeout(() => {
+    diskCacheSaveTimer = null;
+    flushDiskCacheSync();
+  }, 1500);
+  if (typeof diskCacheSaveTimer.unref === 'function') diskCacheSaveTimer.unref();
+}
+
+function getCachedConversationInvocations(conversationId, precomputedStamp = '', precomputedModelDbStamp = '') {
+  ensureDiskCacheLoaded();
+  let stamp = precomputedStamp;
+  if (!stamp) {
+    const dbPath = path.join(CONVERSATIONS_DIR, `${conversationId}.db`);
+    const walPath = `${dbPath}-wal`;
+    stamp = `${getFileStamp(dbPath)}|${getFileStamp(walPath)}`;
+  }
+  const cached = dbInvocationsCache.get(conversationId);
+  if (cached && cached.stamp === stamp) {
+    // Refresh LRU order
+    dbInvocationsCache.delete(conversationId);
+    dbInvocationsCache.set(conversationId, cached);
+    return cached.items;
+  }
+
+  const summary = getConversationModelsFromDb(conversationId, precomputedModelDbStamp);
+  if (!summary) {
+    // Transient SQLite open/lock error or missing file: do not poison cache with empty items.
+    return cached?.items || [];
+  }
   const items = [];
-  if (summary?.invocations?.length) {
+  if (summary.invocations?.length) {
     for (const inv of summary.invocations) {
       const ts = Number(inv.timestampMs || 0);
       if (!ts) continue;
@@ -195,12 +389,19 @@ function getCachedConversationInvocations(conversationId, fallbackUpdatedAtMs = 
       });
     }
   }
-  if (dbInvocationsCache.size > 300) dbInvocationsCache.clear();
+  dbInvocationsCache.delete(conversationId);
+  while (dbInvocationsCache.size >= MAX_DB_CACHE_ENTRIES) {
+    const oldestKey = dbInvocationsCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    dbInvocationsCache.delete(oldestKey);
+  }
   dbInvocationsCache.set(conversationId, { stamp, items });
+  diskCacheDirty = true;
   return items;
 }
 
 function collectPoolInvocations(sinceMs) {
+  ensureDiskCacheLoaded();
   let files = [];
   try {
     files = fs.readdirSync(CONVERSATIONS_DIR);
@@ -209,23 +410,34 @@ function collectPoolInvocations(sinceMs) {
   }
   const out = [];
   const seenReqKeys = new Set();
+  const presentIds = new Set();
   for (const name of files) {
     if (!name.endsWith('.db')) continue;
     const conversationId = name.slice(0, -3);
     if (!conversationId) continue;
+    presentIds.add(conversationId);
     const dbPath = path.join(CONVERSATIONS_DIR, name);
-    let mtimeMs = 0;
+    let dbSt;
     try {
-      mtimeMs = fs.statSync(dbPath).mtimeMs || 0;
+      dbSt = fs.statSync(dbPath);
     } catch {
       continue;
     }
+    let mtimeMs = dbSt.mtimeMs || 0;
+    let walMtimeMs = 0;
+    let walSize = 0;
+    let walStamp = 'missing';
     try {
-      const walMtime = fs.statSync(`${dbPath}-wal`).mtimeMs || 0;
-      if (walMtime > mtimeMs) mtimeMs = walMtime;
+      const walSt = fs.statSync(`${dbPath}-wal`);
+      walMtimeMs = walSt.mtimeMs || 0;
+      walSize = walSt.size || 0;
+      if (walMtimeMs > mtimeMs) mtimeMs = walMtimeMs;
+      walStamp = `${walMtimeMs}:${walSize}`;
     } catch {}
     if (mtimeMs < sinceMs) continue;
-    const items = getCachedConversationInvocations(conversationId, mtimeMs);
+    const stamp = `${dbSt.mtimeMs}:${dbSt.size}|${walStamp}`;
+    const modelDbStamp = `${dbSt.mtimeMs}:${dbSt.size}:${walMtimeMs}:${walSize}`;
+    const items = getCachedConversationInvocations(conversationId, stamp, modelDbStamp);
     for (const inv of items) {
       if (inv.ts < sinceMs) continue;
       if (inv.dedupeKey) {
@@ -233,6 +445,20 @@ function collectPoolInvocations(sinceMs) {
         seenReqKeys.add(inv.dedupeKey);
       }
       out.push(inv);
+    }
+  }
+  // Prune cache entries whose .db files no longer exist on disk
+  for (const cid of dbInvocationsCache.keys()) {
+    if (!presentIds.has(cid)) {
+      dbInvocationsCache.delete(cid);
+      diskCacheDirty = true;
+    }
+  }
+  if (diskCacheDirty) {
+    if (diskCacheNeedsImmediateFlush || !fs.existsSync(QUOTA_DB_CACHE_FILE)) {
+      flushDiskCacheSync();
+    } else {
+      scheduleDiskCacheSave();
     }
   }
   out.sort((a, b) => a.ts - b.ts);
@@ -588,7 +814,7 @@ export function getQuotaAnalytics(optionsOrNow = Date.now()) {
     !force &&
     cachedSummary.value &&
     cachedSummary.stamp === sampleStamp &&
-    nowMs - cachedSummary.computedAtMs < 3500
+    nowMs - cachedSummary.computedAtMs < SUMMARY_CACHE_TTL_MS
   ) {
     return cachedSummary.value;
   }

@@ -2382,7 +2382,6 @@
           timer = null;
         }
         if (document.visibilityState === 'hidden') {
-          timer = setTimeout(scheduleNext, 5000);
           return;
         }
         const isInflight = Boolean(appState.bootstrap?.inflight && !appState.bootstrap?.inflight?.completed);
@@ -2392,7 +2391,7 @@
             await fetchBootstrap(appState.conversationId, true);
           }
           scheduleNext();
-        }, isInflight ? 1400 : 3500);
+        }, isInflight ? 2000 : 6000);
       };
       const onVisibilityChange = () => {
         if (disposed || document.visibilityState === 'hidden') return;

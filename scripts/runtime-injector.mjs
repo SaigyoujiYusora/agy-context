@@ -23,7 +23,7 @@ const DEVTOOLS_PORT_FILES = [
   path.join(USER_HOME, 'AppData', 'Roaming', 'Antigravity', 'DevToolsActivePort'),
   path.join(USER_HOME, '.gemini', 'antigravity', 'DevToolsActivePort')
 ].filter(Boolean);
-const POLL_MS = Math.max(500, Number(process.env.AGY_RUNTIME_POLL_MS || 1500));
+const POLL_MS = Math.max(500, Number(process.env.AGY_RUNTIME_POLL_MS || 2500));
 const ONCE = process.argv.includes('--once');
 const LOCK_PORT = Math.max(1024, Math.min(65535, Number(process.env.AGY_RUNTIME_LOCK_PORT || 18923)));
 const API_BASE = String(process.env.AGY_INSPECTOR_API_BASE || 'http://127.0.0.1:18922').replace(/\/$/, '');

@@ -32,18 +32,42 @@ function statStamp(filePath, includeWal = false) {
   return `${base}:${wal}`;
 }
 
-export function getPromptSourcesRevision(conversationId) {
-  if (!/^[a-zA-Z0-9_-]{1,100}$/.test(conversationId || '')) return 'invalid';
-  const dbFile = path.join(APP_DATA_DIR, 'conversations', `${conversationId}.db`);
+function getPromptSourcesOtherRev(conversationId, skipTranscript) {
   const capFile = path.join(PLUGIN_DATA_DIR, 'native_captures', `by-conversation-${conversationId}.json`);
-  const transcript = path.join(APP_DATA_DIR, 'brain', conversationId, '.system_generated/logs/transcript_full.jsonl');
+  const transcriptStamp = skipTranscript
+    ? 'stored'
+    : statStamp(path.join(APP_DATA_DIR, 'brain', conversationId, '.system_generated/logs/transcript_full.jsonl'), false);
   return [
-    statStamp(dbFile, true),
     statStamp(capFile, false),
-    statStamp(transcript, false),
+    transcriptStamp,
     statStamp(BUILTIN_TEMPLATES_FILE, false),
     statStamp(RULES, false)
   ].join('|');
+}
+
+export function getPromptSourcesRevision(conversationId, dbContentSig = '') {
+  if (!/^[a-zA-Z0-9_-]{1,100}$/.test(conversationId || '')) return 'invalid';
+  const dbFile = path.join(APP_DATA_DIR, 'conversations', `${conversationId}.db`);
+  const cached = promptSourcesCache.get(conversationId);
+  let dbKey = '';
+  let dbMatchesCached = false;
+  if (dbContentSig) {
+    dbKey = `sig:${dbContentSig}`;
+    if (cached) {
+      if (cached.dbContentSig === dbContentSig) {
+        dbMatchesCached = true;
+      } else if (!cached.dbContentSig && cached.dbStat && cached.dbStat === statStamp(dbFile, true)) {
+        cached.dbContentSig = dbContentSig;
+        dbMatchesCached = true;
+      }
+    }
+  } else {
+    dbKey = statStamp(dbFile, true);
+    dbMatchesCached = Boolean(cached && cached.dbStat === dbKey);
+  }
+  // Only skip stat'ing transcript_full.jsonl when a matching cached entry confirmed request-metadata (stored).
+  const skipTranscript = Boolean(dbMatchesCached && cached.hasStored);
+  return `${dbKey}|${getPromptSourcesOtherRev(conversationId, skipTranscript)}`;
 }
 
 export function getNativePromptState() {
@@ -116,15 +140,39 @@ export function syncPromptRules() {
 }
 
 // Local rule files are inspectable, but are not evidence of the complete upstream system message.
-export function getPromptSources(conversationId) {
+export function getPromptSources(conversationId, dbContentSig = '') {
   if (!/^[a-zA-Z0-9_-]{1,100}$/.test(conversationId || '')) return { captured: false, sources: [] };
-  const rev = getPromptSourcesRevision(conversationId);
+  const dbFile = path.join(APP_DATA_DIR, 'conversations', `${conversationId}.db`);
   const cachedSources = promptSourcesCache.get(conversationId);
-  if (cachedSources && cachedSources.rev === rev) {
-    promptSourcesCache.delete(conversationId);
-    promptSourcesCache.set(conversationId, cachedSources);
-    return cachedSources.value;
+  let curDbStat = '';
+  let dbHit = false;
+  if (cachedSources) {
+    if (dbContentSig) {
+      if (cachedSources.dbContentSig === dbContentSig) {
+        dbHit = true;
+      } else if (!cachedSources.dbContentSig) {
+        curDbStat = statStamp(dbFile, true);
+        if (cachedSources.dbStat === curDbStat) {
+          cachedSources.dbContentSig = dbContentSig;
+          dbHit = true;
+        }
+      }
+    } else {
+      curDbStat = statStamp(dbFile, true);
+      if (cachedSources.dbStat === curDbStat) {
+        dbHit = true;
+      }
+    }
   }
+  if (dbHit) {
+    const otherRev = getPromptSourcesOtherRev(conversationId, cachedSources.hasStored);
+    if (cachedSources.otherRev === otherRev) {
+      promptSourcesCache.delete(conversationId);
+      promptSourcesCache.set(conversationId, cachedSources);
+      return cachedSources.value;
+    }
+  }
+  const freshDbStat = curDbStat || statStamp(dbFile, true);
   const sources = [];
   const warnings = [];
   let stored = null;
@@ -185,11 +233,19 @@ export function getPromptSources(conversationId) {
       sources.push({ source: RULES, kind: 'plugin-rules-current', text: rulesCache.text });
     }
   } catch {}
+  const hasStored = Boolean(stored);
+  const otherRev = getPromptSourcesOtherRev(conversationId, hasStored);
   const result = { captured: sources.some(s => s.kind === 'captured-system'), sources, warnings };
   if (promptSourcesCache.has(conversationId)) promptSourcesCache.delete(conversationId);
   while (promptSourcesCache.size >= PROMPT_SOURCES_CACHE_MAX) {
     promptSourcesCache.delete(promptSourcesCache.keys().next().value);
   }
-  promptSourcesCache.set(conversationId, { rev, value: result });
+  promptSourcesCache.set(conversationId, {
+    dbStat: freshDbStat,
+    dbContentSig: dbContentSig || '',
+    otherRev,
+    hasStored,
+    value: result
+  });
   return result;
 }

@@ -4,6 +4,7 @@ import { getPromptSources, getPromptSourcesRevision, syncPromptRules } from './p
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -194,6 +195,7 @@ export function decodeGeneratorMetadataBlob(rawBuf, rowIdx = 0) {
     stepIndices,
     executionId,
     sentModel,
+    sentModelExplicit: Boolean(sentModel),
     responseModel: '',
     responseModelFull: '',
     modelDisplayName: '',
@@ -371,12 +373,19 @@ export function formatActualModelTag(inv) {
 
 let summariesTableCache = { stamp: '', map: new Map(), childrenMap: new Map() };
 const dbSummaryCache = new Map();
-const DB_SUMMARY_CACHE_MAX = 120;
+const DB_SUMMARY_CACHE_MAX = 256;
 const fleetHierarchyCache = new Map();
 const FLEET_CACHE_MAX = 32;
-let recentSortedEntriesCache = { ts: 0, entries: [] };
-let recentConversationsCache = { ts: 0, limit: 0, summariesStamp: '', results: [] };
-const RECENT_SCAN_TTL_MS = 3000;
+const fleetTranscriptCache = new Map();
+const FLEET_TRANSCRIPT_CACHE_MAX = 128;
+let recentSortedEntriesCache = { ts: 0, dirMtimeMs: 0, entries: [] };
+let recentConversationsCache = { ts: 0, limit: 0, summariesStamp: '', dirMtimeMs: 0, results: [] };
+const RECENT_SCAN_TTL_MS = 15000;
+
+function hashBufferShort(buf) {
+  if (!buf || !buf.length) return '';
+  return crypto.createHash('sha1').update(buf).digest('hex').slice(0, 16);
+}
 
 function getFileStamp(filePath) {
   let mtimeMs = 0;
@@ -531,93 +540,116 @@ function readTranscriptFirstLine(transcriptFile) {
   }
 }
 
-export function getConversationModelsFromDb(conversationId, precomputedDbStamp = '', precomputedSummariesStamp = '') {
+function buildSumMetaSig(sumMeta) {
+  if (!sumMeta) return '';
+  return `${sumMeta.title || ''}|${sumMeta.preview || ''}|${sumMeta.lastModifiedMs || 0}|${sumMeta.createdAtMs || 0}|${sumMeta.cwd || ''}|${sumMeta.group || ''}|${sumMeta.status || ''}|${sumMeta.parent_conversation_id || ''}`;
+}
+
+function parseStepsTimestamps(stepRows, stepTsMap, firstStepMs, lastStepMs, maxStepIdx, lastTsStepIdx = -1) {
+  for (const sr of stepRows) {
+    const idx = Number(sr.idx);
+    if (idx > maxStepIdx) maxStepIdx = idx;
+    if (!sr?.m) continue;
+    for (const pf of parseProtoFields(sr.m)) {
+      if (pf.fieldNo === 1 && pf.wireType === 2) {
+        const ms = decodeProtoTimestampMs(pf.value);
+        if (ms > 0) {
+          stepTsMap.set(idx, ms);
+          if (idx > lastTsStepIdx) lastTsStepIdx = idx;
+          if (!firstStepMs || ms < firstStepMs) firstStepMs = ms;
+          if (ms > lastStepMs) lastStepMs = ms;
+        }
+        break;
+      }
+    }
+  }
+  return { firstStepMs, lastStepMs, maxStepIdx, lastTsStepIdx };
+}
+
+function enrichInvocationsModelAndTimestamps(invocations, stepTsMap, startIndex, initialSentByEnum, fallbackFirstMs, effectiveUpdatedAtMs) {
+  const sentByEnum = initialSentByEnum || new Map();
+  for (let i = startIndex; i < invocations.length; i++) {
+    const inv = invocations[i];
+    if (inv.sentModelExplicit && inv.sentModel && inv.modelEnum) {
+      sentByEnum.set(inv.modelEnum, inv.sentModel);
+    } else if (!inv.sentModel && inv.modelEnum && sentByEnum.has(inv.modelEnum)) {
+      inv.sentModel = sentByEnum.get(inv.modelEnum);
+    }
+    if (!inv.sentModel && inv.responseModel && inv.modelDisplayName) {
+      const tierMatch = inv.modelDisplayName.match(/\((Low|Medium|High|Extra Low)\)\s*$/i);
+      if (tierMatch) {
+        const tierSlug = tierMatch[1].toLowerCase().replace(/\s+/g, '-');
+        if (!inv.responseModel.toLowerCase().endsWith(`-${tierSlug}`)) {
+          inv.sentModel = `${inv.responseModel}-${tierSlug}`;
+        }
+      }
+    }
+    inv.actualModelLabel = formatActualModelTag(inv);
+  }
+
+  let prevInvMs = startIndex > 0
+    ? (invocations[startIndex - 1]?.timestampMs || fallbackFirstMs || effectiveUpdatedAtMs)
+    : (fallbackFirstMs || effectiveUpdatedAtMs);
+  for (let i = startIndex; i < invocations.length; i++) {
+    const inv = invocations[i];
+    let tsMs = 0;
+    const sIndices = Array.isArray(inv.stepIndices) ? inv.stepIndices : [];
+    for (let j = sIndices.length - 1; j >= 0; j--) {
+      if (stepTsMap.has(sIndices[j])) {
+        tsMs = stepTsMap.get(sIndices[j]);
+        break;
+      }
+    }
+    if (!tsMs && inv.lastStepIndex >= 0 && stepTsMap.has(inv.lastStepIndex)) {
+      tsMs = stepTsMap.get(inv.lastStepIndex);
+    }
+    if (tsMs > 0) {
+      prevInvMs = tsMs;
+    } else {
+      tsMs = prevInvMs || effectiveUpdatedAtMs;
+    }
+    inv.timestampMs = tsMs;
+  }
+  return sentByEnum;
+}
+
+export function getConversationModelsFromDb(conversationId, precomputedDbStamp = '', _precomputedSummariesStamp = '') {
   const dbPath = path.join(CONVERSATIONS_DIR, `${conversationId}.db`);
   if (!precomputedDbStamp && !fs.existsSync(dbPath)) return null;
 
-  const dbStamp = `${precomputedDbStamp || getFileStamp(dbPath)}|${precomputedSummariesStamp || getFileStamp(SUMMARIES_DB_PATH)}`;
+  const ownDbStamp = precomputedDbStamp || getFileStamp(dbPath);
+  const sumMeta = getSummaryMetaFromSummariesDb(conversationId);
+  const metaSig = buildSumMetaSig(sumMeta);
   const cached = dbSummaryCache.get(conversationId);
-  if (cached && cached.stamp === dbStamp) {
+  if (cached && cached.ownDbStamp === ownDbStamp) {
     dbSummaryCache.delete(conversationId);
-    dbSummaryCache.set(conversationId, cached);
-    return cached.summary;
+    if (cached.metaSig === metaSig) {
+      dbSummaryCache.set(conversationId, cached);
+      return cached.summary;
+    }
+    // Only summary metadata (e.g. title/cwd/status) changed; rebuild in-memory without re-opening SQLite
+    const raw = cached.raw;
+    const title = (sumMeta && (sumMeta.title || sumMeta.preview))
+      ? String(sumMeta.title || sumMeta.preview).trim().slice(0, 70)
+      : raw.fallbackTitle;
+    const sumModMs = sumMeta?.lastModifiedMs || 0;
+    const effectiveUpdatedAtMs = raw.walSize > 0
+      ? Math.max(raw.lastStepMs, sumModMs, raw.statMtimeMs, raw.walMtimeMs)
+      : (raw.lastStepMs || sumModMs || raw.statMtimeMs);
+    const effectiveCreatedAtMs = raw.firstStepMs || sumMeta?.createdAtMs || raw.birthMs || effectiveUpdatedAtMs;
+    const summary = buildConversationSummary(conversationId, title, effectiveUpdatedAtMs, raw.invocations, sumMeta, {
+      createdAtMs: effectiveCreatedAtMs,
+      cwd: sumMeta?.cwd || '',
+      group: sumMeta?.group || ''
+    });
+    const refreshed = { ownDbStamp, metaSig, raw, summary };
+    dbSummaryCache.set(conversationId, refreshed);
+    return summary;
   }
 
   let db;
   try {
     db = new DatabaseSync(dbPath, { readOnly: true });
-    const rows = db.prepare('SELECT idx, size, data FROM gen_metadata ORDER BY idx ASC').all();
-    const invocations = rows.map(r => decodeGeneratorMetadataBlob(r.data, Number(r.idx)));
-
-    // CascadeConfig (f3.f28 = sentModel) is recorded on turn-start rows of gen_metadata
-    // and omitted on tool-continuation steps within the same turn. Carry it forward per modelEnum,
-    // and if still absent, infer from displayName tier suffix (e.g. "Gemini 4 Carbon (Medium)" -> "gemini-4-carbon-medium")
-    // when responseModel is a bare family name.
-    const sentByEnum = new Map();
-    for (const inv of invocations) {
-      if (inv.sentModel && inv.modelEnum) {
-        sentByEnum.set(inv.modelEnum, inv.sentModel);
-      } else if (!inv.sentModel && inv.modelEnum && sentByEnum.has(inv.modelEnum)) {
-        inv.sentModel = sentByEnum.get(inv.modelEnum);
-      }
-      if (!inv.sentModel && inv.responseModel && inv.modelDisplayName) {
-        const tierMatch = inv.modelDisplayName.match(/\((Low|Medium|High|Extra Low)\)\s*$/i);
-        if (tierMatch) {
-          const tierSlug = tierMatch[1].toLowerCase().replace(/\s+/g, '-');
-          if (!inv.responseModel.toLowerCase().endsWith(`-${tierSlug}`)) {
-            inv.sentModel = `${inv.responseModel}-${tierSlug}`;
-          }
-        }
-      }
-      inv.actualModelLabel = formatActualModelTag(inv);
-    }
-
-    let title = '';
-    const sumMeta = getSummaryMetaFromSummariesDb(conversationId);
-    if (sumMeta && (sumMeta.title || sumMeta.preview)) {
-      title = String(sumMeta.title || sumMeta.preview).trim().slice(0, 70);
-    }
-
-    if (!title) {
-      const transcriptFile = path.join(BRAIN_DIR, conversationId, '.system_generated', 'logs', 'transcript.jsonl');
-      if (fs.existsSync(transcriptFile)) {
-        try {
-          const firstLine = readTranscriptFirstLine(transcriptFile);
-          if (firstLine) {
-            const parsed = JSON.parse(firstLine);
-            if (parsed.content) {
-              title = String(parsed.content)
-                .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/g, '')
-                .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/g, '')
-                .replace(/<\/?USER_REQUEST>/g, '')
-                .trim()
-                .slice(0, 70);
-            }
-          }
-        } catch {}
-      }
-    }
-
-    const stepTsMap = new Map();
-    let firstStepMs = 0;
-    let lastStepMs = 0;
-    try {
-      const stepRows = db.prepare('SELECT idx, substr(metadata, 1, 24) AS m FROM steps ORDER BY idx ASC').all();
-      for (const sr of stepRows) {
-        if (!sr?.m) continue;
-        for (const pf of parseProtoFields(sr.m)) {
-          if (pf.fieldNo === 1 && pf.wireType === 2) {
-            const ms = decodeProtoTimestampMs(pf.value);
-            if (ms > 0) {
-              stepTsMap.set(Number(sr.idx), ms);
-              if (!firstStepMs || ms < firstStepMs) firstStepMs = ms;
-              if (ms > lastStepMs) lastStepMs = ms;
-            }
-            break;
-          }
-        }
-      }
-    } catch {}
 
     const stat = fs.statSync(dbPath);
     let walMtimeMs = 0;
@@ -632,33 +664,240 @@ export function getConversationModelsFromDb(conversationId, precomputedDbStamp =
     }
 
     const sumModMs = sumMeta?.lastModifiedMs || 0;
+    const birthMs = cached?.raw?.birthMs ?? (stat.birthtimeMs > 946684800000 ? stat.birthtimeMs : 0);
+
+    // Try O(log N) incremental tail read when we already have a cached snapshot for this conversation.
+    // Falls back automatically to a full scan on first load or if rollback/compaction shrank max idx.
+    let usedIncremental = false;
+    let invocations = null;
+    let stepTsMap = null;
+    let firstStepMs = 0;
+    let lastStepMs = 0;
+    let maxGenIdx = -1;
+    let lastGenSize = -1;
+    let lastGenData = null;
+    let lastGenByteLen = 0;
+    let lastGenHash = '';
+    let maxStepIdx = -1;
+    let lastTsStepIdx = -1;
+    let fallbackTitle = cached?.raw?.fallbackTitle || '';
+
+    const prevRaw = cached?.raw;
+    if (prevRaw && prevRaw.stepTsMap instanceof Map && typeof prevRaw.maxGenIdx === 'number' && typeof prevRaw.maxStepIdx === 'number') {
+      try {
+        const tailGen = db.prepare('SELECT idx, size, data FROM gen_metadata ORDER BY idx DESC LIMIT 1').get();
+        const tailStep = db.prepare('SELECT idx FROM steps ORDER BY idx DESC LIMIT 1').get();
+        const dbMaxGenIdx = tailGen ? Number(tailGen.idx) : -1;
+        const dbLastGenSize = tailGen ? Number(tailGen.size || 0) : -1;
+        const dbLastGenData = tailGen?.data ? Buffer.from(tailGen.data) : null;
+        const dbMaxStepIdx = tailStep ? Number(tailStep.idx) : -1;
+
+        let anchorIntact = dbMaxGenIdx >= prevRaw.maxGenIdx && dbMaxStepIdx >= prevRaw.maxStepIdx;
+        // Guard against rollback + immediate re-advance past previous maxStepIdx between polls:
+        // verify previous maxStepIdx still exists AND latest timestamped step anchor has exact same created_at.
+        if (anchorIntact && prevRaw.maxStepIdx >= 0) {
+          const prevLastTsStepIdx = typeof prevRaw.lastTsStepIdx === 'number' ? prevRaw.lastTsStepIdx : -1;
+          const verifyStepTimestamp = (idx) => {
+            const anchorRow = db.prepare('SELECT idx, substr(metadata, 1, 24) AS m FROM steps WHERE idx = ?').get(idx);
+            if (!anchorRow?.m) return false;
+            let anchorMs = 0;
+            for (const pf of parseProtoFields(anchorRow.m)) {
+              if (pf.fieldNo === 1 && pf.wireType === 2) {
+                anchorMs = decodeProtoTimestampMs(pf.value);
+                break;
+              }
+            }
+            return anchorMs === prevRaw.stepTsMap.get(idx);
+          };
+
+          if (prevLastTsStepIdx === prevRaw.maxStepIdx && prevRaw.stepTsMap.has(prevLastTsStepIdx)) {
+            if (!verifyStepTimestamp(prevLastTsStepIdx)) anchorIntact = false;
+          } else {
+            const maxStepRow = db.prepare('SELECT idx FROM steps WHERE idx = ?').get(prevRaw.maxStepIdx);
+            if (!maxStepRow) {
+              anchorIntact = false;
+            } else if (prevLastTsStepIdx >= 0 && prevRaw.stepTsMap.has(prevLastTsStepIdx)) {
+              if (!verifyStepTimestamp(prevLastTsStepIdx)) anchorIntact = false;
+            } else {
+              // No timestamped step exists to prove prefix integrity against rollback+re-advance
+              anchorIntact = false;
+            }
+          }
+        }
+
+        if (anchorIntact) {
+          stepTsMap = prevRaw.stepTsMap;
+          firstStepMs = prevRaw.firstStepMs;
+          lastStepMs = prevRaw.lastStepMs;
+          maxStepIdx = prevRaw.maxStepIdx;
+          lastTsStepIdx = typeof prevRaw.lastTsStepIdx === 'number' ? prevRaw.lastTsStepIdx : -1;
+
+          let stepsAdded = false;
+          if (dbMaxStepIdx > prevRaw.maxStepIdx) {
+            const newStepRows = db.prepare('SELECT idx, substr(metadata, 1, 24) AS m FROM steps WHERE idx > ? ORDER BY idx ASC').all(prevRaw.maxStepIdx);
+            if (newStepRows.length > 0) {
+              stepTsMap = new Map(prevRaw.stepTsMap);
+              const updated = parseStepsTimestamps(newStepRows, stepTsMap, firstStepMs, lastStepMs, maxStepIdx, lastTsStepIdx);
+              firstStepMs = updated.firstStepMs;
+              lastStepMs = updated.lastStepMs;
+              maxStepIdx = updated.maxStepIdx;
+              lastTsStepIdx = updated.lastTsStepIdx;
+              stepsAdded = true;
+            }
+          }
+
+          const effectiveUpdatedAtMs = walSize > 0
+            ? Math.max(lastStepMs, sumModMs, stat.mtimeMs, walMtimeMs)
+            : (lastStepMs || sumModMs || stat.mtimeMs);
+
+          const sameLastGenBytes =
+            dbLastGenData && prevRaw.lastGenData
+              ? Buffer.compare(dbLastGenData, prevRaw.lastGenData) === 0
+              : dbLastGenData === prevRaw.lastGenData;
+          const genUnchanged =
+            dbMaxGenIdx === prevRaw.maxGenIdx &&
+            dbLastGenSize === prevRaw.lastGenSize &&
+            sameLastGenBytes;
+
+          if (genUnchanged) {
+            invocations = prevRaw.invocations;
+            lastGenByteLen = prevRaw.lastGenByteLen ?? (dbLastGenData ? dbLastGenData.length : 0);
+            lastGenHash = prevRaw.lastGenHash ?? hashBufferShort(dbLastGenData);
+            if (stepsAdded && invocations.length > 0) {
+              // Refresh only the last invocation's timestamp in case its step arrived after gen_metadata
+              const lastIdx = invocations.length - 1;
+              const prevSent = new Map();
+              for (let i = 0; i < lastIdx; i++) {
+                if (invocations[i].sentModelExplicit && invocations[i].sentModel && invocations[i].modelEnum) {
+                  prevSent.set(invocations[i].modelEnum, invocations[i].sentModel);
+                }
+              }
+              invocations = invocations.slice();
+              invocations[lastIdx] = { ...invocations[lastIdx] };
+              enrichInvocationsModelAndTimestamps(invocations, stepTsMap, lastIdx, prevSent, firstStepMs, effectiveUpdatedAtMs);
+            }
+          } else {
+            const startIdx = prevRaw.maxGenIdx >= 0 ? prevRaw.maxGenIdx : 0;
+            const tailRows = db.prepare('SELECT idx, size, data FROM gen_metadata WHERE idx >= ? ORDER BY idx ASC').all(startIdx);
+            let keepLen = prevRaw.invocations.length;
+            while (keepLen > 0 && Number(prevRaw.invocations[keepLen - 1].idx) >= startIdx) {
+              keepLen -= 1;
+            }
+            const prefix = prevRaw.invocations.slice(0, keepLen);
+            const sentByEnum = new Map();
+            for (let i = 0; i < prefix.length; i++) {
+              if (prefix[i].sentModelExplicit && prefix[i].sentModel && prefix[i].modelEnum) {
+                sentByEnum.set(prefix[i].modelEnum, prefix[i].sentModel);
+              }
+            }
+            const decodedTail = tailRows.map(r => decodeGeneratorMetadataBlob(r.data, Number(r.idx)));
+            invocations = prefix.concat(decodedTail);
+            enrichInvocationsModelAndTimestamps(invocations, stepTsMap, prefix.length, sentByEnum, firstStepMs, effectiveUpdatedAtMs);
+            lastGenByteLen = dbLastGenData ? dbLastGenData.length : 0;
+            lastGenHash = hashBufferShort(dbLastGenData);
+          }
+
+          maxGenIdx = dbMaxGenIdx;
+          lastGenSize = dbLastGenSize;
+          lastGenData = dbLastGenData;
+          usedIncremental = true;
+        }
+      } catch {
+        usedIncremental = false;
+      }
+    }
+
+    if (!usedIncremental) {
+      const rows = db.prepare('SELECT idx, size, data FROM gen_metadata ORDER BY idx ASC').all();
+      invocations = rows.map(r => decodeGeneratorMetadataBlob(r.data, Number(r.idx)));
+      if (rows.length > 0) {
+        const lastRow = rows[rows.length - 1];
+        maxGenIdx = Number(lastRow.idx);
+        lastGenSize = Number(lastRow.size || 0);
+        lastGenData = lastRow.data ? Buffer.from(lastRow.data) : null;
+        lastGenByteLen = lastGenData ? lastGenData.length : 0;
+        lastGenHash = hashBufferShort(lastGenData);
+      } else {
+        maxGenIdx = -1;
+        lastGenSize = -1;
+        lastGenData = null;
+        lastGenByteLen = 0;
+        lastGenHash = '';
+      }
+
+      stepTsMap = new Map();
+      firstStepMs = 0;
+      lastStepMs = 0;
+      maxStepIdx = -1;
+      lastTsStepIdx = -1;
+      try {
+        const stepRows = db.prepare('SELECT idx, substr(metadata, 1, 24) AS m FROM steps ORDER BY idx ASC').all();
+        const parsed = parseStepsTimestamps(stepRows, stepTsMap, firstStepMs, lastStepMs, maxStepIdx, lastTsStepIdx);
+        firstStepMs = parsed.firstStepMs;
+        lastStepMs = parsed.lastStepMs;
+        maxStepIdx = parsed.maxStepIdx;
+        lastTsStepIdx = parsed.lastTsStepIdx;
+      } catch {}
+
+      const effectiveUpdatedAtMsInit = walSize > 0
+        ? Math.max(lastStepMs, sumModMs, stat.mtimeMs, walMtimeMs)
+        : (lastStepMs || sumModMs || stat.mtimeMs);
+      enrichInvocationsModelAndTimestamps(invocations, stepTsMap, 0, null, firstStepMs, effectiveUpdatedAtMsInit);
+    }
+
+    let title = '';
+    if (sumMeta && (sumMeta.title || sumMeta.preview)) {
+      title = String(sumMeta.title || sumMeta.preview).trim().slice(0, 70);
+    }
+
+    if (!title) {
+      if (fallbackTitle) {
+        title = fallbackTitle;
+      } else {
+        const transcriptFile = path.join(BRAIN_DIR, conversationId, '.system_generated', 'logs', 'transcript.jsonl');
+        if (fs.existsSync(transcriptFile)) {
+          try {
+            const firstLine = readTranscriptFirstLine(transcriptFile);
+            if (firstLine) {
+              const parsed = JSON.parse(firstLine);
+              if (parsed.content) {
+                fallbackTitle = String(parsed.content)
+                  .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/g, '')
+                  .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/g, '')
+                  .replace(/<\/?USER_REQUEST>/g, '')
+                  .trim()
+                  .slice(0, 70);
+                title = fallbackTitle;
+              }
+            }
+          } catch {}
+        }
+      }
+    }
+
     const effectiveUpdatedAtMs = walSize > 0
       ? Math.max(lastStepMs, sumModMs, stat.mtimeMs, walMtimeMs)
       : (lastStepMs || sumModMs || stat.mtimeMs);
-    const birthMs = stat.birthtimeMs > 946684800000 ? stat.birthtimeMs : 0;
     const effectiveCreatedAtMs = firstStepMs || sumMeta?.createdAtMs || birthMs || effectiveUpdatedAtMs;
 
-    let prevInvMs = firstStepMs || effectiveUpdatedAtMs;
-    for (const inv of invocations) {
-      let tsMs = 0;
-      const sIndices = Array.isArray(inv.stepIndices) ? inv.stepIndices : [];
-      for (let i = sIndices.length - 1; i >= 0; i--) {
-        if (stepTsMap.has(sIndices[i])) {
-          tsMs = stepTsMap.get(sIndices[i]);
-          break;
-        }
-      }
-      if (!tsMs && inv.lastStepIndex >= 0 && stepTsMap.has(inv.lastStepIndex)) {
-        tsMs = stepTsMap.get(inv.lastStepIndex);
-      }
-      if (tsMs > 0) {
-        prevInvMs = tsMs;
-      } else {
-        tsMs = prevInvMs || effectiveUpdatedAtMs;
-      }
-      inv.timestampMs = tsMs;
-    }
-
+    const raw = {
+      invocations,
+      fallbackTitle,
+      firstStepMs,
+      lastStepMs,
+      birthMs,
+      statMtimeMs: stat.mtimeMs,
+      walMtimeMs,
+      walSize,
+      stepTsMap,
+      maxGenIdx,
+      lastGenSize,
+      lastGenData,
+      lastGenByteLen,
+      lastGenHash,
+      maxStepIdx,
+      lastTsStepIdx
+    };
     const summary = buildConversationSummary(conversationId, title, effectiveUpdatedAtMs, invocations, sumMeta, {
       createdAtMs: effectiveCreatedAtMs,
       cwd: sumMeta?.cwd || '',
@@ -669,7 +908,7 @@ export function getConversationModelsFromDb(conversationId, precomputedDbStamp =
       const oldestKey = dbSummaryCache.keys().next().value;
       if (oldestKey !== undefined) dbSummaryCache.delete(oldestKey);
     }
-    dbSummaryCache.set(conversationId, { stamp: dbStamp, summary });
+    dbSummaryCache.set(conversationId, { ownDbStamp, metaSig, raw, summary });
     return summary;
   } catch {
     return null;
@@ -827,16 +1066,50 @@ export function buildConversationSummary(conversationId, title, updatedAtMs, inv
   };
 }
 
+function statConversationDbFile(dbFull, sumRow = null) {
+  let dbMtime = 0;
+  let dbSize = 0;
+  let walMtime = 0;
+  let walSize = 0;
+  let hasDb = false;
+  try {
+    const st = fs.statSync(dbFull);
+    dbMtime = st.mtimeMs;
+    dbSize = st.size;
+    hasDb = true;
+  } catch {}
+  try {
+    const wm = fs.statSync(`${dbFull}-wal`);
+    walMtime = wm.mtimeMs;
+    walSize = wm.size;
+  } catch {}
+  let mtimeMs = dbMtime;
+  if (walSize > 0 && walMtime > mtimeMs) mtimeMs = walMtime;
+  if (walSize === 0 && sumRow?.lastModifiedMs > 0) {
+    mtimeMs = sumRow.lastModifiedMs;
+  }
+  return {
+    mtimeMs,
+    stamp: hasDb ? `${dbMtime}:${dbSize}:${walMtime}:${walSize}` : ''
+  };
+}
+
 export function listRecentConversations(limit = 20) {
   if (!fs.existsSync(CONVERSATIONS_DIR)) return [];
   const now = Date.now();
   const requestedLimit = limit > 0 ? limit : Infinity;
+  let dirMtimeMs = 0;
+  try {
+    dirMtimeMs = fs.statSync(CONVERSATIONS_DIR).mtimeMs;
+  } catch {}
+
   const summariesCache = ensureSummariesTableCache();
-  const summariesStamp = getFileStamp(SUMMARIES_DB_PATH);
+  const summariesStamp = summariesCache.stamp || getFileStamp(SUMMARIES_DB_PATH);
   if (
     (now - recentConversationsCache.ts) < RECENT_SCAN_TTL_MS &&
     recentConversationsCache.limit >= requestedLimit &&
     recentConversationsCache.summariesStamp === summariesStamp &&
+    recentConversationsCache.dirMtimeMs === dirMtimeMs &&
     recentConversationsCache.results.length > 0
   ) {
     const headId = recentConversationsCache.results[0].conversationId;
@@ -848,61 +1121,75 @@ export function listRecentConversations(limit = 20) {
   }
 
   let entries = recentSortedEntriesCache.entries;
-  if (
+  const needFullDirScan =
     !entries.length ||
-    (now - recentSortedEntriesCache.ts) >= RECENT_SCAN_TTL_MS ||
-    recentConversationsCache.summariesStamp !== summariesStamp
-  ) {
+    recentSortedEntriesCache.dirMtimeMs !== dirMtimeMs ||
+    (now - recentSortedEntriesCache.ts) >= 60000;
+
+  if (needFullDirScan) {
     entries = fs.readdirSync(CONVERSATIONS_DIR)
       .filter(f => f.endsWith('.db'))
       .map(f => {
         const id = f.slice(0, -3);
         const dbFull = path.join(CONVERSATIONS_DIR, f);
-        const walFull = `${dbFull}-wal`;
-        let mtimeMs = 0;
-        let dbMtime = 0;
-        let dbSize = 0;
-        let walMtime = 0;
-        let walSize = 0;
-        let hasDb = false;
-        try {
-          const st = fs.statSync(dbFull);
-          dbMtime = st.mtimeMs;
-          dbSize = st.size;
-          mtimeMs = dbMtime;
-          hasDb = true;
-        } catch {}
-        try {
-          const wm = fs.statSync(walFull);
-          walMtime = wm.mtimeMs;
-          walSize = wm.size;
-          if (walSize > 0 && walMtime > mtimeMs) mtimeMs = walMtime;
-        } catch {}
-        if (walSize === 0) {
-          const sumRow = summariesCache.map.get(id);
-          if (sumRow?.lastModifiedMs > 0) {
-            mtimeMs = sumRow.lastModifiedMs;
-          }
-        }
+        const sumRow = summariesCache.map.get(id);
+        const st = statConversationDbFile(dbFull, sumRow);
         return {
           id,
-          mtimeMs,
-          stamp: hasDb ? `${dbMtime}:${dbSize}:${walMtime}:${walSize}` : ''
+          mtimeMs: st.mtimeMs,
+          sumModMs: sumRow?.lastModifiedMs || 0,
+          stamp: st.stamp
         };
       })
       .sort((a, b) => b.mtimeMs - a.mtimeMs);
-    recentSortedEntriesCache = { ts: now, entries };
+    recentSortedEntriesCache = { ts: now, dirMtimeMs, entries };
+  } else {
+    // Fast in-memory resort using updated summariesCache without stat'ing 519+ files
+    let anyChanged = false;
+    for (const item of entries) {
+      const sumModMs = summariesCache.map.get(item.id)?.lastModifiedMs || 0;
+      if (sumModMs !== item.sumModMs) {
+        item.sumModMs = sumModMs;
+        if (sumModMs > item.mtimeMs) item.mtimeMs = sumModMs;
+        item.stamp = '';
+        anyChanged = true;
+      }
+    }
+    if (anyChanged) {
+      entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    }
+    // Refresh live .db/-wal stamps and mtimes for the visible slice (at least top-3) so live WAL writes
+    // both update invocation counts and re-sort active conversations without passing stale stamps.
+    const refreshCount = limit > 0 ? Math.min(entries.length, Math.max(3, limit)) : entries.length;
+    let anyMtimeMoved = false;
+    for (let i = 0; i < refreshCount; i++) {
+      const item = entries[i];
+      const dbFull = path.join(CONVERSATIONS_DIR, `${item.id}.db`);
+      const st = statConversationDbFile(dbFull, summariesCache.map.get(item.id));
+      item.stamp = st.stamp;
+      if (st.mtimeMs > item.mtimeMs) {
+        item.mtimeMs = st.mtimeMs;
+        anyMtimeMoved = true;
+      }
+    }
+    if (anyMtimeMoved) {
+      entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    }
   }
 
   const results = [];
   const targetEntries = limit > 0 ? entries.slice(0, limit) : entries;
   for (const item of targetEntries) {
+    const dbFull = path.join(CONVERSATIONS_DIR, `${item.id}.db`);
+    if (!item.stamp) {
+      item.stamp = getFileStamp(dbFull);
+    }
     const summary = getConversationModelsFromDb(item.id, item.stamp || '', summariesStamp);
     if (summary && summary.invocationCount > 0) {
       results.push(summary);
     }
   }
-  recentConversationsCache = { ts: now, limit: requestedLimit, summariesStamp, results };
+  recentConversationsCache = { ts: now, limit: requestedLimit, summariesStamp, dirMtimeMs, results };
   return results;
 }
 
@@ -1574,11 +1861,34 @@ export function getSessionTranscriptAnalytics(conversationId, summary = null, op
     try { stat = fs.statSync(transcriptFile); } catch {}
   }
 
+  const cachedDbEntry = conversationId ? dbSummaryCache.get(conversationId) : null;
+  const cachedRaw = (cachedDbEntry && cachedDbEntry.summary === resolvedSummary) ? cachedDbEntry.raw : null;
   const invCount = resolvedSummary?.invocationCount || 0;
+  const latestInv = resolvedSummary?.invocations?.length
+    ? resolvedSummary.invocations[resolvedSummary.invocations.length - 1]
+    : null;
+  const dbContentSig = (resolvedSummary && cachedRaw)
+    ? [
+        invCount,
+        latestInv?.idx ?? -1,
+        cachedRaw.lastGenSize ?? -1,
+        cachedRaw.lastGenByteLen ?? 0,
+        cachedRaw.lastGenHash || '',
+        latestInv?.inputTokens ?? 0,
+        latestInv?.cacheReadTokens ?? 0,
+        latestInv?.outputTokens ?? 0,
+        latestInv?.thinkingOutputTokens ?? 0,
+        latestInv?.estimatedContextTokens ?? 0,
+        latestInv?.ttftSeconds ?? 0,
+        latestInv?.streamingSeconds ?? 0,
+        latestInv?.actualModelLabel || '',
+        latestInv?.requestId || ''
+      ].join(':')
+    : '';
   const fleet = conversationId ? getFleetUsageRollup(conversationId, resolvedSummary) : null;
   const fleetStamp = fleet?.stamp || '';
   const cached = conversationId ? transcriptAnalyticsCache.get(conversationId) : null;
-  const promptRevision = getPromptSourcesRevision(conversationId);
+  const promptRevision = getPromptSourcesRevision(conversationId, dbContentSig);
   if (
     cached &&
     cached.promptRevision === promptRevision &&
@@ -1999,7 +2309,7 @@ export function getSessionTranscriptAnalytics(conversationId, summary = null, op
     ? Math.max(6000, firstPromptTok - firstUserTokensEst)
     : 14000;
   // Explicitly distinguish captured system messages, local rules and estimates.
-  const promptSources = getPromptSources(conversationId);
+  const promptSources = getPromptSources(conversationId, dbContentSig);
   const requestSystem = promptSources.sources.find(s => s.kind === 'captured-system' && s.provenance === 'request-metadata');
   const nativeCapture = promptSources.sources.find(s => s.kind === 'captured-system' && s.source.startsWith('native_captures/'));
   const capturedSystem = requestSystem ? [requestSystem] : nativeCapture ? [nativeCapture] : promptSources.sources.filter(s => s.kind === 'captured-system');
@@ -2281,7 +2591,7 @@ export function getSessionTranscriptAnalytics(conversationId, summary = null, op
       if (oldestKey !== undefined) transcriptAnalyticsCache.delete(oldestKey);
     }
     transcriptAnalyticsCache.set(conversationId, {
-      promptRevision,
+      promptRevision: getPromptSourcesRevision(conversationId, dbContentSig),
       mtimeMs: stat?.mtimeMs || 0,
       size: stat?.size || 0,
       invCount,
@@ -2298,6 +2608,96 @@ export function getSessionTranscriptAnalytics(conversationId, summary = null, op
  * Reconstructs the parent coordinator + child subagents Fleet hierarchy,
  * delegation briefs, inter-agent messages, and per-node context composition.
  */
+function parseFleetTranscriptCached(cid) {
+  const tf = path.join(BRAIN_DIR, cid, '.system_generated', 'logs', 'transcript.jsonl');
+  if (!fs.existsSync(tf)) return null;
+  let stamp = '';
+  try {
+    const st = fs.statSync(tf);
+    stamp = `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return null;
+  }
+  const cached = fleetTranscriptCache.get(cid);
+  if (cached && cached.stamp === stamp) {
+    fleetTranscriptCache.delete(cid);
+    fleetTranscriptCache.set(cid, cached);
+    return cached.data;
+  }
+
+  const metaEntries = [];
+  const delegations = [];
+  const comms = [];
+  try {
+    const lines = fs.readFileSync(tf, 'utf8').split(/\r?\n/);
+    let lastInvokeQueue = [];
+    for (const l of lines) {
+      if (!l || (!l.includes('invoke_subagent') && !l.includes('send_message') && !l.includes('Created the following subagent') && !l.includes('sender='))) continue;
+      let st;
+      try { st = JSON.parse(l); } catch { continue; }
+      if (st.type === 'PLANNER_RESPONSE' && Array.isArray(st.tool_calls)) {
+        for (const tc of st.tool_calls) {
+          if (tc?.name === 'invoke_subagent') {
+            lastInvokeQueue.push({
+              role: unquoteArg(tc.args?.Role || ''),
+              typeName: unquoteArg(tc.args?.TypeName || ''),
+              requestedModel: unquoteArg(tc.args?.Model || ''),
+              prompt: unquoteArg(tc.args?.Prompt || '').slice(0, 1200),
+              time: st.created_at || ''
+            });
+          } else if (tc?.name === 'send_message') {
+            comms.push({
+              kind: 'relay',
+              from: cid,
+              to: unquoteArg(tc.args?.Recipient || ''),
+              text: unquoteArg(tc.args?.Message || '').slice(0, 1200),
+              time: st.created_at || ''
+            });
+          }
+        }
+      } else if (st.type === 'GENERIC') {
+        const c = String(st.content || '');
+        const m = c.match(/Created the following subagent:[\s\S]*?"conversationId"\s*:\s*"([^"]+)"/i);
+        if (m?.[1]) {
+          const info = lastInvokeQueue.shift() || {};
+          const childCid = m[1].trim();
+          metaEntries.push([childCid, info]);
+          delegations.push({
+            from: cid,
+            to: childCid,
+            role: info.role || 'Subagent',
+            prompt: info.prompt || '',
+            time: st.created_at || info.time || ''
+          });
+        }
+      } else if (st.type === 'SYSTEM_MESSAGE') {
+        const c = String(st.content || '');
+        const sm = c.match(/\bsender=([^\s\r\n>]+)/);
+        if (sm?.[1]) {
+          comms.push({
+            kind: 'settled',
+            from: sm[1].trim(),
+            to: cid,
+            text: c.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1200),
+            time: st.created_at || ''
+          });
+        }
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  const data = { stamp, metaEntries, delegations, comms };
+  fleetTranscriptCache.delete(cid);
+  if (fleetTranscriptCache.size >= FLEET_TRANSCRIPT_CACHE_MAX) {
+    const oldest = fleetTranscriptCache.keys().next().value;
+    if (oldest !== undefined) fleetTranscriptCache.delete(oldest);
+  }
+  fleetTranscriptCache.set(cid, { stamp, data });
+  return data;
+}
+
 export function getFleetHierarchy(conversationId) {
   const empty = {
     rootId: conversationId || '',
@@ -2309,28 +2709,13 @@ export function getFleetHierarchy(conversationId) {
   };
   if (!conversationId || !fs.existsSync(SUMMARIES_DB_PATH)) return empty;
 
-  const fleetStamp = getFileStamp(SUMMARIES_DB_PATH);
-  const cachedFleet = fleetHierarchyCache.get(conversationId);
-  if (cachedFleet && cachedFleet.stamp === fleetStamp) {
-    fleetHierarchyCache.delete(conversationId);
-    fleetHierarchyCache.set(conversationId, cachedFleet);
-    return cachedFleet.data;
-  }
-
-  let sdb;
   try {
-    sdb = new DatabaseSync(SUMMARIES_DB_PATH, { readOnly: true });
-    const getRow = sdb.prepare(
-      'SELECT conversation_id, parent_conversation_id, title, status FROM conversation_summaries WHERE conversation_id = ?'
-    );
-    const getChildren = sdb.prepare(
-      'SELECT conversation_id, parent_conversation_id, title, status FROM conversation_summaries WHERE parent_conversation_id = ?'
-    );
+    const { map: sumMap, childrenMap } = ensureSummariesTableCache();
 
     let rootId = conversationId;
     const seenUp = new Set([rootId]);
     for (let depth = 0; depth < 6; depth++) {
-      const r = getRow.get(rootId);
+      const r = sumMap.get(rootId);
       const pid = String(r?.parent_conversation_id || '').trim();
       if (!pid || seenUp.has(pid)) break;
       seenUp.add(pid);
@@ -2342,86 +2727,73 @@ export function getFleetHierarchy(conversationId) {
     const rawNodes = [];
     while (queue.length > 0 && rawNodes.length < 128) {
       const cid = queue.shift();
-      const row = getRow.get(cid);
+      const row = sumMap.get(cid);
       rawNodes.push({
         conversationId: cid,
         parentConversationId: String(row?.parent_conversation_id || '').trim(),
         dbTitle: String(row?.title || '').trim(),
-        status: row?.status ?? null
+        dbPreview: String(row?.preview || '').trim(),
+        status: row?.status ?? null,
+        lastModifiedMs: row?.lastModifiedMs || 0
       });
-      const kids = getChildren.all(cid);
-      for (const k of kids) {
-        if (k?.conversation_id && !visited.has(k.conversation_id)) {
-          visited.add(k.conversation_id);
-          queue.push(k.conversation_id);
+      const kids = childrenMap.get(cid) || [];
+      for (const kidId of kids) {
+        if (kidId && !visited.has(kidId)) {
+          visited.add(kidId);
+          queue.push(kidId);
         }
       }
+    }
+
+    const recentMulti = [];
+    for (const [parentId, kids] of childrenMap.entries()) {
+      if (!kids || kids.length === 0) continue;
+      const pRow = sumMap.get(parentId);
+      if (!pRow) continue;
+      recentMulti.push({
+        conversationId: parentId,
+        title: String(pRow.title || parentId.slice(0, 8)),
+        childCount: kids.length,
+        lastModifiedMs: pRow.lastModifiedMs || 0
+      });
+    }
+    recentMulti.sort((a, b) => b.lastModifiedMs - a.lastModifiedMs);
+    const topRecentMulti = recentMulti.slice(0, 8).map(r => ({
+      conversationId: r.conversationId,
+      title: r.title,
+      childCount: r.childCount
+    }));
+
+    const nodeSigParts = [];
+    const parsedTranscripts = [];
+    for (const rn of rawNodes) {
+      const parsed = parseFleetTranscriptCached(rn.conversationId);
+      parsedTranscripts.push(parsed);
+      const dbPath = path.join(CONVERSATIONS_DIR, `${rn.conversationId}.db`);
+      const dbSt = fs.existsSync(dbPath) ? getFileStamp(dbPath) : '0';
+      nodeSigParts.push(`${rn.conversationId}:${rn.status || ''}:${rn.lastModifiedMs}:${JSON.stringify(rn.dbTitle)}:${JSON.stringify(rn.dbPreview)}:${dbSt}:${parsed?.stamp || '0'}`);
+    }
+    const recentSig = topRecentMulti.map(r => `${r.conversationId}:${r.childCount}:${JSON.stringify(r.title)}`).join(',');
+    const fleetStamp = `${rootId}|${nodeSigParts.join(';')}|${recentSig}`;
+
+    const cachedFleet = fleetHierarchyCache.get(conversationId);
+    if (cachedFleet && cachedFleet.stamp === fleetStamp) {
+      fleetHierarchyCache.delete(conversationId);
+      fleetHierarchyCache.set(conversationId, cachedFleet);
+      return cachedFleet.data;
     }
 
     const metaByChildId = new Map();
     const delegations = [];
     const comms = [];
 
-    for (const rn of rawNodes) {
-      const tf = path.join(BRAIN_DIR, rn.conversationId, '.system_generated', 'logs', 'transcript.jsonl');
-      if (!fs.existsSync(tf)) continue;
-      try {
-        const lines = fs.readFileSync(tf, 'utf8').split(/\r?\n/);
-        let lastInvokeQueue = [];
-        for (const l of lines) {
-          if (!l || (!l.includes('invoke_subagent') && !l.includes('send_message') && !l.includes('Created the following subagent') && !l.includes('sender='))) continue;
-          let st;
-          try { st = JSON.parse(l); } catch { continue; }
-          if (st.type === 'PLANNER_RESPONSE' && Array.isArray(st.tool_calls)) {
-            for (const tc of st.tool_calls) {
-              if (tc?.name === 'invoke_subagent') {
-                lastInvokeQueue.push({
-                  role: unquoteArg(tc.args?.Role || ''),
-                  typeName: unquoteArg(tc.args?.TypeName || ''),
-                  requestedModel: unquoteArg(tc.args?.Model || ''),
-                  prompt: unquoteArg(tc.args?.Prompt || '').slice(0, 1200),
-                  time: st.created_at || ''
-                });
-              } else if (tc?.name === 'send_message') {
-                comms.push({
-                  kind: 'relay',
-                  from: rn.conversationId,
-                  to: unquoteArg(tc.args?.Recipient || ''),
-                  text: unquoteArg(tc.args?.Message || '').slice(0, 1200),
-                  time: st.created_at || ''
-                });
-              }
-            }
-          } else if (st.type === 'GENERIC') {
-            const c = String(st.content || '');
-            const m = c.match(/Created the following subagent:[\s\S]*?"conversationId"\s*:\s*"([^"]+)"/i);
-            if (m?.[1]) {
-              const info = lastInvokeQueue.shift() || {};
-              const childCid = m[1].trim();
-              metaByChildId.set(childCid, info);
-              delegations.push({
-                from: rn.conversationId,
-                to: childCid,
-                role: info.role || 'Subagent',
-                prompt: info.prompt || '',
-                time: st.created_at || info.time || ''
-              });
-            }
-          } else if (st.type === 'SYSTEM_MESSAGE') {
-            const c = String(st.content || '');
-            const sm = c.match(/\bsender=([^\s\r\n>]+)/);
-            if (sm?.[1]) {
-              comms.push({
-                kind: 'settled',
-                from: sm[1].trim(),
-                to: rn.conversationId,
-                text: c.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1200),
-                time: st.created_at || ''
-              });
-            }
-          }
-        }
-      } catch {}
+    for (const parsed of parsedTranscripts) {
+      if (!parsed) continue;
+      for (const [childCid, info] of parsed.metaEntries) {
+        metaByChildId.set(childCid, info);
+      }
+      for (const d of parsed.delegations) delegations.push(d);
+      for (const c of parsed.comms) comms.push(c);
     }
 
     const nodes = rawNodes.map((rn, idx) => {
@@ -2464,26 +2836,13 @@ export function getFleetHierarchy(conversationId) {
       };
     });
 
-    const recentMulti = sdb.prepare(`
-      SELECT p.conversation_id as conversationId, p.title as title, COUNT(c.conversation_id) as childCount
-      FROM conversation_summaries p
-      JOIN conversation_summaries c ON c.parent_conversation_id = p.conversation_id
-      GROUP BY p.conversation_id
-      ORDER BY p.rowid DESC
-      LIMIT 8
-    `).all();
-
     const result = {
       rootId,
       currentId: conversationId,
       nodes,
       delegations,
       comms,
-      recentMultiAgentSessions: recentMulti.map(r => ({
-        conversationId: r.conversationId,
-        title: String(r.title || r.conversationId.slice(0, 8)),
-        childCount: Number(r.childCount || 0)
-      }))
+      recentMultiAgentSessions: topRecentMulti
     };
     fleetHierarchyCache.delete(conversationId);
     if (fleetHierarchyCache.size >= FLEET_CACHE_MAX) {
@@ -2494,8 +2853,6 @@ export function getFleetHierarchy(conversationId) {
     return result;
   } catch {
     return empty;
-  } finally {
-    try { sdb?.close(); } catch {}
   }
 }
 
