@@ -16,6 +16,7 @@ import {
   checkForPluginUpdate,
   startUpdateCheckScheduler
 } from '../../scripts/update_checker.mjs';
+import { ensureDirectDllSynced } from '../../scripts/dll_auto_sync.mjs';
 import {
   PLUGIN_DATA_DIR,
   BADGE_PORT,
@@ -113,6 +114,7 @@ function readUiHtml() {
 const port = parseInt(process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || '18922', 10);
 const lsAddr = process.env.ANTIGRAVITY_LS_ADDRESS || '';
 const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN || '';
+let dllSyncStatus = null;
 
 if (lsAddr && csrf && port !== BADGE_PORT) {
   saveLsEndpoint(lsAddr, csrf, port);
@@ -522,7 +524,7 @@ async function handleRequest(req, res) {
       sendJson(res, 200, { ok: true, unchanged: true, targetId: bs.targetId || targetId, revision: bs.revision });
       return;
     }
-    sendJson(res, 200, bs);
+    sendJson(res, 200, dllSyncStatus ? { ...bs, dllSync: dllSyncStatus } : bs);
     return;
   }
 
@@ -589,7 +591,14 @@ async function handleRequest(req, res) {
   }
 
   if (url.pathname === '/api/health') {
-    sendJson(res, 200, { ok: true, pid: process.pid, port, lsAddress: lsAddr || '', directOverlay: process.env.AGY_DISABLE_RUNTIME_INJECTOR === '1' });
+    sendJson(res, 200, {
+      ok: true,
+      pid: process.pid,
+      port,
+      lsAddress: lsAddr || '',
+      directOverlay: process.env.AGY_DISABLE_RUNTIME_INJECTOR === '1',
+      dllSync: dllSyncStatus
+    });
     return;
   }
 
@@ -626,6 +635,14 @@ server.on('error', (err) => {
 
 server.listen(port, '127.0.0.1', () => {
   console.log(`[agy-model-inspector] Sidecar UI listening on http://127.0.0.1:${port}`);
+  try {
+    dllSyncStatus = ensureDirectDllSynced({ directOverlay: process.env.AGY_DISABLE_RUNTIME_INJECTOR === '1' });
+    if (dllSyncStatus?.dllAction && dllSyncStatus.dllAction !== 'up_to_date') {
+      console.log(`[agy-model-inspector] Auto-synced DWrite.dll (${dllSyncStatus.status}${dllSyncStatus.agVersion ? `, AGY ${dllSyncStatus.agVersion}` : ''}).`);
+    }
+  } catch (err) {
+    dllSyncStatus = { ok: false, status: 'error', error: String(err?.message || err), needsRestart: false };
+  }
   startQuotaAutoRefreshScheduler();
   startUpdateCheckScheduler();
   if (process.env.AGY_DISABLE_RUNTIME_INJECTOR !== '1') {

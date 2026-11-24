@@ -2475,7 +2475,30 @@
       { id: 'settings', label: '插件设置' }
     ];
 
+    const [dllBannerDismissed, setDllBannerDismissed] = React.useState(false);
+
     const activeLocaleVal = cachedLocaleSnap.active;
+    const dllSync = bs?.dllSync || null;
+    const showDllBanner = Boolean(dllSync?.needsRestart && !dllBannerDismissed);
+    const dllBannerText = (() => {
+      if (!showDllBanner) return '';
+      const isEn = activeLocaleVal === 'en';
+      const verTag = dllSync.agVersion ? (isEn ? ` (AGY v${dllSync.agVersion})` : `（AGY v${dllSync.agVersion}）`) : '';
+      const revTag = dllSync.dllRev ? ` Rev ${dllSync.dllRev}` : '';
+      if (dllSync.status === 'installed') {
+        return isEn
+          ? `Auto-installed DWrite.dll${revTag}${verTag}. Fully quit and reopen Antigravity once to activate the bottom status bar.`
+          : `已自动安装/补装 DWrite.dll${revTag}${verTag} — 请完全退出并重启一次 Antigravity 以启用底部状态栏。`;
+      }
+      if (dllSync.status === 'updated') {
+        return isEn
+          ? `Auto-updated DWrite.dll${revTag}${verTag}. Reopen Antigravity once to switch to the new loader.`
+          : `已自动更新 DWrite.dll${revTag}${verTag} — 重启一次 Antigravity 即可切换新版加载器。`;
+      }
+      return isEn
+        ? `Detected Antigravity update${verTag} and repaired loader bootstrap files. Reopen Antigravity once to restore the bottom status bar.`
+        : `检测到 Antigravity 更新${verTag}，已自动修复引导文件 — 重启一次 Antigravity 即可恢复底部状态栏。`;
+    })();
 
     return h('div', { className: 'agy-shell' },
       // Authentic DSH Session Chrome + Underline Tab Bar
@@ -2545,6 +2568,20 @@
           ))
         )
       ),
+
+      showDllBanner
+        ? h('div', { className: 'agy-dll-banner', role: 'status' },
+            h('span', { className: 'agy-dll-banner-dot', 'aria-hidden': 'true' }),
+            h('span', { className: 'agy-dll-banner-text' }, dllBannerText),
+            h('button', {
+              type: 'button',
+              className: 'agy-dll-banner-close',
+              onClick: () => setDllBannerDismissed(true),
+              title: activeLocaleVal === 'en' ? 'Dismiss' : '关闭提示',
+              'aria-label': activeLocaleVal === 'en' ? 'Dismiss' : '关闭提示'
+            }, '×')
+          )
+        : null,
 
       // Main Scrollable dsh-context Viewport ([data-conversation-scroll])
       h('main', { className: 'agy-scroll-viewport', 'data-conversation-scroll': '' },
