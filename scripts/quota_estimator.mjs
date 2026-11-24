@@ -544,43 +544,86 @@ function analyzePoolWindow(poolKey, windowType, samples, invocations, nowMs) {
       sampleCount: 0,
       latest: null,
       liveUsage: null,
-      estimate: null
+      estimate: null,
+      previousCycleEstimate: null
     };
   }
 
-  // Group entries into cycles ordered chronologically
+  // Group entries into cycles ordered chronologically.
+  // Keep non-contiguous 'unstarted' (resetAtMs == null) runs distinct so later idle
+  // snapshots never merge back into an earlier unstarted bucket.
   const cycles = [];
   const byCycleId = new Map();
+  let unstartedRunSeq = 0;
+  let latestCycleId = null;
   for (const e of entries) {
-    const cid = clusterResetCycle(e.resetAtMs, windowType);
-    let cyc = byCycleId.get(cid);
-    if (!cyc) {
-      cyc = { id: cid, resetAtMs: e.resetAtMs, entries: [] };
-      byCycleId.set(cid, cyc);
-      cycles.push(cyc);
-    } else if (e.resetAtMs) {
-      cyc.resetAtMs = e.resetAtMs;
+    let cyc;
+    if (!e.resetAtMs) {
+      const prevCyc = cycles[cycles.length - 1];
+      if (prevCyc && prevCyc.unstarted) {
+        cyc = prevCyc;
+      } else {
+        unstartedRunSeq += 1;
+        cyc = { id: `unstarted:${unstartedRunSeq}`, unstarted: true, resetAtMs: null, entries: [] };
+        cycles.push(cyc);
+      }
+    } else {
+      const cid = clusterResetCycle(e.resetAtMs, windowType);
+      cyc = byCycleId.get(cid);
+      if (!cyc) {
+        cyc = { id: cid, unstarted: false, resetAtMs: e.resetAtMs, entries: [] };
+        byCycleId.set(cid, cyc);
+        cycles.push(cyc);
+      } else {
+        cyc.resetAtMs = e.resetAtMs;
+      }
     }
     cyc.entries.push(e);
+    latestCycleId = cyc.id;
   }
 
   // Build regression points across all cycles with usedPct > 0 and valid resetAtMs,
-  // and track highest observed spend while still showing 100% left (for airtight lower bound).
+  // and track highest observed spend per cycle while still showing 100% left (for airtight lower bound).
   const regressionMap = new Map();
-  let maxZeroPctUsd = 0;
+  const maxZeroPctUsdByCycle = new Map();
   let prevResetAtMs = 0;
+  let prevLastCapturedAtMs = 0;
   const cycleBounds = new Map();
 
   for (const cyc of cycles) {
-    const rawStart = cyc.resetAtMs ? cyc.resetAtMs - windowMs - toleranceMs : null;
-    const searchStart = rawStart ? Math.max(prevResetAtMs, rawStart) : null;
+    const nominalStart = cyc.resetAtMs ? cyc.resetAtMs - windowMs : null;
+    const rawStart = nominalStart ? nominalStart - toleranceMs : null;
+    let searchStart = null;
+    if (rawStart) {
+      const cycFirstCaptured = cyc.entries.length ? cyc.entries[0].capturedAtMs : 0;
+      const cycHasExact = cyc.entries.some((e) => e.exactFraction);
+      // For early resets, allow realistic clock/request-to-resetTime skew (3m for 5h or exact RPC;
+      // 15m for coarse weekly DOM labels) without bleeding a full 70m of prior-cycle spend.
+      const earlySkewMs = (windowType === 'fiveHour' || cycHasExact) ? 3 * 60_000 : 15 * 60_000;
+      // If Google resets a quota window early, the previous cycle's scheduled prevResetAtMs is
+      // still in the future (later than this new cycle's nominalStart or first sample). Never
+      // push searchStart past this cycle's start; bound it instead to the actual transition after
+      // the prior started cycle's last observed sample.
+      const earlyReset = Boolean(
+        prevResetAtMs &&
+        (prevResetAtMs > nominalStart + 60_000 || (cycFirstCaptured && prevResetAtMs > cycFirstCaptured))
+      );
+      const boundedPrevLast = (prevLastCapturedAtMs > 0 && (!cycFirstCaptured || prevLastCapturedAtMs < cycFirstCaptured))
+        ? prevLastCapturedAtMs
+        : 0;
+      const effectivePrevEnd = earlyReset
+        ? Math.max(boundedPrevLast ? boundedPrevLast + 1 : 0, nominalStart - earlySkewMs)
+        : prevResetAtMs;
+      searchStart = Math.max(effectivePrevEnd, rawStart);
+    }
     cycleBounds.set(cyc.id, { searchStart, resetAtMs: cyc.resetAtMs });
 
     if (searchStart) {
       for (const e of cyc.entries) {
         const usage = sumPoolWindow(invocations, poolKey, searchStart, e.capturedAtMs + 5000);
         if (e.usedPct <= 0) {
-          if (usage.usd > maxZeroPctUsd) maxZeroPctUsd = usage.usd;
+          const prevZero = maxZeroPctUsdByCycle.get(cyc.id) || 0;
+          if (usage.usd > prevZero) maxZeroPctUsdByCycle.set(cyc.id, usage.usd);
           continue;
         }
         if (usage.usd <= 0 && usage.totalTokens <= 0) continue;
@@ -627,11 +670,14 @@ function analyzePoolWindow(poolKey, windowType, samples, invocations, nowMs) {
       if (cyc.resetAtMs && cyc.resetAtMs > prevResetAtMs) {
         prevResetAtMs = cyc.resetAtMs;
       }
+      const cycLastCaptured = cyc.entries.length ? cyc.entries[cyc.entries.length - 1].capturedAtMs : 0;
+      if (cycLastCaptured > prevLastCapturedAtMs) {
+        prevLastCapturedAtMs = cycLastCaptured;
+      }
     }
   }
 
   const latest = entries[entries.length - 1];
-  const latestCycleId = clusterResetCycle(latest.resetAtMs, windowType);
   const latestBound = cycleBounds.get(latestCycleId) || { searchStart: null, resetAtMs: latest.resetAtMs };
   const expired = Boolean(latest.resetAtMs && nowMs >= latest.resetAtMs);
 
@@ -645,142 +691,183 @@ function analyzePoolWindow(poolKey, windowType, samples, invocations, nowMs) {
     liveUsage = { calls: 0, inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, thinkingTokens: 0, totalTokens: 0, usd: 0, firstCallMs: null, lastCallMs: null, byModel: {} };
   }
 
-  const allPointsRaw = [...regressionMap.values()];
-  // Google's 5h quota dynamically smooths global aggregate demand across cycles,
-  // whereas weekly quota is tied directly to the user's tier.
-  // Restrict 5h regression strictly to the current active cycle so prior cycles' load factors
-  // cannot overpower the current cycle.
-  const allPoints = windowType === 'fiveHour'
-    ? (expired ? [] : allPointsRaw.filter((p) => p.cycleId === latestCycleId))
-    : allPointsRaw;
-  // Filter stale-cache RPC reads: if a newer exact sample in the same cycle arrived within 2 minutes
-  // with a strictly higher usedPct, the earlier point was a pre-flush cached server snapshot.
-  const rawExactPoints = allPoints.filter((p) => p.exactFraction).sort((a, b) => a.capturedAtMs - b.capturedAtMs);
-  const exactPoints = rawExactPoints.filter((pt, idx) => {
-    for (let j = idx + 1; j < rawExactPoints.length; j++) {
-      const nxt = rawExactPoints[j];
-      if (nxt.cycleId !== pt.cycleId) break;
-      if (nxt.capturedAtMs - pt.capturedAtMs <= 2 * 60_000 && nxt.usedPct > pt.usedPct + 0.05) {
-        return false;
-      }
-    }
-    return true;
-  });
-  const usingExact = exactPoints.length > 0;
-  const points = usingExact ? exactPoints : allPoints;
-  let estimate = null;
-
-  if (points.length > 0) {
-    // Weighted least squares through origin: usd = Q * (usedPct / 100)
-    // Weighting by u^2 naturally gives deeper usage points much higher weight than shallow points.
-    let numUsd = 0;
-    let numTok = 0;
-    let den = 0;
-    let deepest = points[0];
-    for (const pt of points) {
-      const u = pt.usedPct / 100;
-      numUsd += u * pt.usd;
-      numTok += u * pt.totalTokens;
-      den += u * u;
-      if (pt.usedPct > deepest.usedPct || (pt.usedPct === deepest.usedPct && pt.capturedAtMs > deepest.capturedAtMs)) {
-        deepest = pt;
-      }
-    }
-
-    const estTotalUsd = den > 0 ? numUsd / den : 0;
-    const estTotalTokens = den > 0 ? Math.round(numTok / den) : 0;
-
-    let lowUsd = estTotalUsd;
-    let highUsd = estTotalUsd;
-    let relErrPct = 10;
-    let precision = '样本偏少';
-    let confidenceTier = 'low';
-
-    if (usingExact) {
-      // Exact floating-point remainingFraction still carries ~±1.2–2.0% server-side jitter/bounce
-      // plus pricing-weight variance across models/cache ratios. Reflect both empirical scatter
-      // and a realistic noise floor so shallow samples (<10% used) never claim false high confidence.
-      const baseBand = deepest.usedPct >= 15 ? 0.06 : deepest.usedPct >= 10 ? 0.10 : 0.14;
-      const noiseFloor = Math.min(0.45, 1.2 / Math.max(1.5, deepest.usedPct));
-      let empBand = 0;
-      if (points.length >= 2 && estTotalUsd > 0) {
-        let weightedDev = 0;
-        let wSum = 0;
-        for (const pt of points) {
-          const u = pt.usedPct / 100;
-          if (u <= 0) continue;
-          const ptQ = pt.usd / u;
-          const relDev = Math.abs(ptQ - estTotalUsd) / estTotalUsd;
-          weightedDev += u * relDev;
-          wSum += u;
+  const computeEstimate = (cyclePoints, opts = {}) => {
+    const { isHistorical = false, maxZeroPctUsd = 0 } = opts;
+    // Filter stale-cache RPC reads: if a newer exact sample in the same cycle arrived within 2 minutes
+    // with a strictly higher usedPct, the earlier point was a pre-flush cached server snapshot.
+    const rawExactPoints = cyclePoints.filter((p) => p.exactFraction).sort((a, b) => a.capturedAtMs - b.capturedAtMs);
+    const exactPoints = rawExactPoints.filter((pt, idx) => {
+      for (let j = idx + 1; j < rawExactPoints.length; j++) {
+        const nxt = rawExactPoints[j];
+        if (nxt.cycleId !== pt.cycleId) break;
+        if (nxt.capturedAtMs - pt.capturedAtMs <= 2 * 60_000 && nxt.usedPct > pt.usedPct + 0.05) {
+          return false;
         }
-        empBand = wSum > 0 ? weightedDev / wSum : 0;
       }
-      const relBand = Math.max(baseBand, noiseFloor, Math.min(0.45, empBand * 1.4));
-      lowUsd = estTotalUsd * (1 - relBand);
-      highUsd = estTotalUsd * (1 + relBand);
-      relErrPct = Math.max(3, Math.round(relBand * 100));
-      if (deepest.usedPct >= 10 && relBand <= 0.22 && points.length >= 2) {
-        precision = '高置信';
-        confidenceTier = 'high';
-      } else if (deepest.usedPct >= 3 && relBand <= 0.36) {
-        precision = '收敛中';
-        confidenceTier = 'mid';
+      return true;
+    });
+    const usingExact = exactPoints.length > 0;
+    const points = usingExact ? exactPoints : cyclePoints;
+
+    if (points.length > 0) {
+      // Weighted least squares through origin: usd = Q * (usedPct / 100)
+      // Weighting by u^2 naturally gives deeper usage points much higher weight than shallow points.
+      let numUsd = 0;
+      let numTok = 0;
+      let den = 0;
+      let deepest = points[0];
+      for (const pt of points) {
+        const u = pt.usedPct / 100;
+        numUsd += u * pt.usd;
+        numTok += u * pt.totalTokens;
+        den += u * u;
+        if (pt.usedPct > deepest.usedPct || (pt.usedPct === deepest.usedPct && pt.capturedAtMs > deepest.capturedAtMs)) {
+          deepest = pt;
+        }
       }
-    } else {
-      // Legacy integer-percentage quantization uncertainty band from the deepest observed point
-      const uLow = Math.max(0.005, (deepest.usedPct - 0.5) / 100);
-      const uHigh = Math.min(1, (deepest.usedPct + 1.0) / 100);
-      lowUsd = Math.min(estTotalUsd, deepest.usd / uHigh);
-      highUsd = Math.max(estTotalUsd, deepest.usd / uLow);
-      relErrPct = Math.max(2, Math.round(50 / Math.max(1, deepest.usedPct)));
-      if (deepest.usedPct >= 12) {
-        precision = '高置信';
-        confidenceTier = 'high';
-      } else if (deepest.usedPct >= 4) {
-        precision = '收敛中';
-        confidenceTier = 'mid';
+
+      const estTotalUsd = den > 0 ? numUsd / den : 0;
+      const estTotalTokens = den > 0 ? Math.round(numTok / den) : 0;
+
+      let lowUsd = estTotalUsd;
+      let highUsd = estTotalUsd;
+      let relErrPct = 10;
+      let precision = '样本偏少';
+      let confidenceTier = 'low';
+
+      if (usingExact) {
+        // Exact floating-point remainingFraction still carries ~±1.2–2.0% server-side jitter/bounce
+        // plus pricing-weight variance across models/cache ratios. Reflect both empirical scatter
+        // and a realistic noise floor so shallow samples (<10% used) never claim false high confidence.
+        const baseBand = deepest.usedPct >= 15 ? 0.06 : deepest.usedPct >= 10 ? 0.10 : 0.14;
+        const noiseFloor = Math.min(0.45, 1.2 / Math.max(1.5, deepest.usedPct));
+        let empBand = 0;
+        if (points.length >= 2 && estTotalUsd > 0) {
+          let weightedDev = 0;
+          let wSum = 0;
+          for (const pt of points) {
+            const u = pt.usedPct / 100;
+            if (u <= 0) continue;
+            const ptQ = pt.usd / u;
+            const relDev = Math.abs(ptQ - estTotalUsd) / estTotalUsd;
+            weightedDev += u * relDev;
+            wSum += u;
+          }
+          empBand = wSum > 0 ? weightedDev / wSum : 0;
+        }
+        const relBand = Math.max(baseBand, noiseFloor, Math.min(0.45, empBand * 1.4));
+        lowUsd = estTotalUsd * (1 - relBand);
+        highUsd = estTotalUsd * (1 + relBand);
+        relErrPct = Math.max(3, Math.round(relBand * 100));
+        if (deepest.usedPct >= 10 && relBand <= 0.22 && points.length >= 2) {
+          precision = '高置信';
+          confidenceTier = 'high';
+        } else if (deepest.usedPct >= 3 && relBand <= 0.36) {
+          precision = '收敛中';
+          confidenceTier = 'mid';
+        }
+      } else {
+        // Legacy integer-percentage quantization uncertainty band from the deepest observed point
+        const uLow = Math.max(0.005, (deepest.usedPct - 0.5) / 100);
+        const uHigh = Math.min(1, (deepest.usedPct + 1.0) / 100);
+        lowUsd = Math.min(estTotalUsd, deepest.usd / uHigh);
+        highUsd = Math.max(estTotalUsd, deepest.usd / uLow);
+        relErrPct = Math.max(2, Math.round(50 / Math.max(1, deepest.usedPct)));
+        if (deepest.usedPct >= 12) {
+          precision = '高置信';
+          confidenceTier = 'high';
+        } else if (deepest.usedPct >= 4) {
+          precision = '收敛中';
+          confidenceTier = 'mid';
+        }
       }
+
+      if (isHistorical) {
+        return {
+          status: 'estimated',
+          estTotalUsd: Number(estTotalUsd.toFixed(2)),
+          lowUsd: Number(lowUsd.toFixed(2)),
+          highUsd: Number(highUsd.toFixed(2)),
+          estTotalTokens,
+          maxUsedPctObserved: Number(deepest.usedPct.toFixed(2)),
+          pointCount: points.length,
+          exactFraction: usingExact,
+          precision,
+          confidenceTier,
+          relErrPct,
+          method: points.length >= 2 ? 'wls' : 'single'
+        };
+      }
+
+      // Anchor remaining estimate directly to the server's latest real remaining %,
+      // subtracting only incremental spend recorded AFTER latest.capturedAtMs.
+      // This guarantees projectedLeftPct never contradicts or exceeds latest.leftPct.
+      const deltaAfterSample = !expired && latest?.capturedAtMs
+        ? sumPoolWindow(invocations, poolKey, latest.capturedAtMs + 1, nowMs + 60_000).usd
+        : 0;
+      const anchoredLeftPct = expired
+        ? 100
+        : Math.max(0, Math.min(100, latest.leftPct - (estTotalUsd > 0 ? (deltaAfterSample / estTotalUsd) * 100 : 0)));
+      const projectedLeftPct =
+        !expired && deltaAfterSample > 0 && estTotalUsd > 0
+          ? Number(anchoredLeftPct.toFixed(2))
+          : null;
+
+      return {
+        status: 'estimated',
+        estTotalUsd: Number(estTotalUsd.toFixed(2)),
+        lowUsd: Number(lowUsd.toFixed(2)),
+        highUsd: Number(highUsd.toFixed(2)),
+        estTotalTokens,
+        estRemainingUsd: Number(Math.max(0, estTotalUsd * (anchoredLeftPct / 100)).toFixed(2)),
+        projectedLeftPct,
+        maxUsedPctObserved: Number(deepest.usedPct.toFixed(2)),
+        pointCount: points.length,
+        exactFraction: usingExact,
+        precision,
+        confidenceTier,
+        relErrPct,
+        method: points.length >= 2 ? 'wls' : 'single'
+      };
     }
 
-    // Anchor remaining estimate directly to the server's latest real remaining %,
-    // subtracting only incremental spend recorded AFTER latest.capturedAtMs.
-    // This guarantees projectedLeftPct never contradicts or exceeds latest.leftPct.
-    const deltaAfterSample = !expired && latest?.capturedAtMs
-      ? sumPoolWindow(invocations, poolKey, latest.capturedAtMs + 1, nowMs + 60_000).usd
-      : 0;
-    const anchoredLeftPct = expired
-      ? 100
-      : Math.max(0, Math.min(100, latest.leftPct - (estTotalUsd > 0 ? (deltaAfterSample / estTotalUsd) * 100 : 0)));
-    const projectedLeftPct =
-      !expired && deltaAfterSample > 0 && estTotalUsd > 0
-        ? Number(anchoredLeftPct.toFixed(2))
-        : null;
+    if (!isHistorical && !expired && maxZeroPctUsd > 0) {
+      // Still at 100% left at sample time while having real spend -> airtight lower bound
+      return {
+        status: 'lower_bound',
+        minBoundUsd: Number((maxZeroPctUsd / 0.01).toFixed(2)),
+        pointCount: 0,
+        precision: '仅下界'
+      };
+    }
+    return null;
+  };
 
-    estimate = {
-      status: 'estimated',
-      estTotalUsd: Number(estTotalUsd.toFixed(2)),
-      lowUsd: Number(lowUsd.toFixed(2)),
-      highUsd: Number(highUsd.toFixed(2)),
-      estTotalTokens,
-      estRemainingUsd: Number(Math.max(0, estTotalUsd * (anchoredLeftPct / 100)).toFixed(2)),
-      projectedLeftPct,
-      maxUsedPctObserved: Number(deepest.usedPct.toFixed(2)),
-      pointCount: points.length,
-      exactFraction: usingExact,
-      precision,
-      confidenceTier,
-      relErrPct,
-      method: points.length >= 2 ? 'wls' : 'single'
-    };
-  } else if (!expired && maxZeroPctUsd > 0) {
-    // Still at 100% left at sample time while having real spend -> airtight lower bound
-    estimate = {
-      status: 'lower_bound',
-      minBoundUsd: Number((maxZeroPctUsd / 0.01).toFixed(2)),
-      pointCount: 0,
-      precision: '仅下界'
-    };
+  const allPointsRaw = [...regressionMap.values()];
+  // Estimate the current cycle strictly from its own samples so resets or quota adjustments
+  // are never masked by prior cycles, and compute the most recent prior cycle separately for comparison.
+  const currentCyclePoints = expired ? [] : allPointsRaw.filter((p) => p.cycleId === latestCycleId);
+  const estimate = computeEstimate(currentCyclePoints, {
+    isHistorical: false,
+    maxZeroPctUsd: maxZeroPctUsdByCycle.get(latestCycleId) || 0
+  });
+
+  let previousCycleEstimate = null;
+  for (let i = cycles.length - 1; i >= 0; i--) {
+    const cyc = cycles[i];
+    if (!expired && cyc.id === latestCycleId) continue;
+    const prevPts = allPointsRaw.filter((p) => p.cycleId === cyc.id);
+    if (!prevPts.length) continue;
+    const prevEst = computeEstimate(prevPts, { isHistorical: true });
+    if (prevEst) {
+      const lastEntry = cyc.entries[cyc.entries.length - 1];
+      previousCycleEstimate = {
+        ...prevEst,
+        cycleId: cyc.id,
+        endedAtMs: lastEntry?.capturedAtMs || cyc.resetAtMs || null
+      };
+      break;
+    }
   }
 
   return {
@@ -798,7 +885,8 @@ function analyzePoolWindow(poolKey, windowType, samples, invocations, nowMs) {
       remainingMs: latest.resetAtMs ? Math.max(0, latest.resetAtMs - nowMs) : null
     },
     liveUsage,
-    estimate
+    estimate,
+    previousCycleEstimate
   };
 }
 
@@ -868,7 +956,7 @@ export function getQuotaAnalytics(optionsOrNow = Date.now()) {
 
   const lastSampledAtMs = samples[samples.length - 1]?.capturedAtMs || null;
   const revParts = [
-    'q',
+    'q2',
     samples.length,
     lastSampledAtMs || 0,
     gemini.fiveHour.latest?.leftPct ?? '-',

@@ -8,7 +8,7 @@
 (function installAgyModelInspectorOverlay() {
   'use strict';
 
-  const VERSION = 'runtime-overlay-v38';
+  const VERSION = 'runtime-overlay-v39';
   const BUILD = '20261121-icon-center-v1';
   function loopbackApiBase(value) {
     try {
@@ -861,15 +861,27 @@
         : '尚未计费';
     const usage = win.liveUsage || { usd: 0, totalTokens: 0, calls: 0 };
     const est = win.estimate;
-    let estHtml = esc('待消耗 ≥1%');
-    if (est?.status === 'estimated') {
-      const tier = est.confidenceTier || (est.maxUsedPctObserved >= 10 ? 'high' : est.maxUsedPctObserved >= 3 ? 'mid' : 'low');
-      const confLabel = tier === 'high' ? '高置信' : tier === 'mid' ? '收敛中' : '样本偏少';
-      const confTip = `已观测最高消耗 ${est.maxUsedPctObserved ?? '?'}%，估算误差约 ±${est.relErrPct ?? '?'}%`;
-      estHtml = `${esc(`~${formatShortUsd(est.estTotalUsd)} (${formatShortUsd(est.lowUsd)}–${formatShortUsd(est.highUsd)})`)}<span class="runtime-quota-conf is-${tier}" title="${esc(confTip)}">${esc(confLabel)}</span>`;
-    } else if (est?.status === 'lower_bound') {
-      estHtml = `${esc(`> ${formatShortUsd(est.minBoundUsd)}`)}<span class="runtime-quota-conf is-low" title="当前仍为 100% 满额，仅能确定总额下界">仅下界</span>`;
-    }
+    const prevEst = win.previousCycleEstimate;
+    const buildEstHtml = (e, prefix = '') => {
+      if (e?.status === 'estimated') {
+        const fallbackTier = e.maxUsedPctObserved >= 10 ? 'high' : e.maxUsedPctObserved >= 3 ? 'mid' : 'low';
+        const tier = e.confidenceTier === 'high' || e.confidenceTier === 'mid' || e.confidenceTier === 'low'
+          ? e.confidenceTier
+          : fallbackTier;
+        const confLabel = tier === 'high' ? '高置信' : tier === 'mid' ? '收敛中' : '样本偏少';
+        const confTip = `${prefix}已观测最高消耗 ${e.maxUsedPctObserved ?? '?'}%，估算误差约 ±${e.relErrPct ?? '?'}%`;
+        return `${esc(`~${formatShortUsd(e.estTotalUsd)} (${formatShortUsd(e.lowUsd)}–${formatShortUsd(e.highUsd)})`)}<span class="runtime-quota-conf is-${tier}" title="${esc(confTip)}">${esc(confLabel)}</span>`;
+      }
+      if (e?.status === 'lower_bound') {
+        return `${esc(`> ${formatShortUsd(e.minBoundUsd)}`)}<span class="runtime-quota-conf is-low" title="当前仍为 100% 满额，仅能确定总额下界">仅下界</span>`;
+      }
+      return esc('待消耗 ≥1%');
+    };
+    const hasPrev = prevEst?.status === 'estimated';
+    const estHtml = buildEstHtml(est, hasPrev ? '本周期' : '');
+    const prevRowHtml = hasPrev
+      ? `<div class="runtime-quota-sub"><span>上周期推算</span><strong>${buildEstHtml(prevEst, '上周期')}</strong></div>`
+      : '';
     const spendLine = usage.calls > 0
       ? `~${formatShortUsd(usage.usd)} · ${formatCompact(usage.totalTokens)} tok (${formatInteger(usage.calls)}次)`
       : '本周期暂无调用';
@@ -880,7 +892,8 @@
       <div class="runtime-row"><span>${esc(title)}</span><strong>剩 ${esc(leftPctLabel)}${esc(projLine)} (${esc(resetText)})</strong></div>
       <div class="runtime-quota-bar"><i class="${barClass}" style="width:${Math.max(0, Math.min(100, leftPct))}%"></i></div>
       <div class="runtime-quota-sub"><span>本周期实耗</span><strong>${esc(spendLine)}</strong></div>
-      <div class="runtime-quota-sub"><span>推算总额度</span><strong>${estHtml}</strong></div>
+      <div class="runtime-quota-sub"><span>${hasPrev ? '本周期推算' : '推算总额度'}</span><strong>${estHtml}</strong></div>
+      ${prevRowHtml}
     `;
   }
 

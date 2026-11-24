@@ -2127,27 +2127,33 @@
             const resetText = win.expired ? '已重置' : (win.latest?.remainingMs ? fmtCountdown(win.latest.remainingMs) : '尚未计费');
             const usage = win.liveUsage || { usd: 0, totalTokens: 0, calls: 0 };
             const est = win.estimate;
+            const prevEst = win.previousCycleEstimate;
             const projText = est?.status === 'estimated' && est.projectedLeftPct !== null && !win.expired && Math.abs(est.projectedLeftPct - leftPct) >= 0.8
               ? ` · 估剩 ${est.projectedLeftPct.toFixed(1)}%`
               : '';
             const spendText = usage.calls > 0
               ? `~${fmtShortUsd(usage.usd)} · ${fmtCompact(usage.totalTokens)} tok (${fmtInt(usage.calls)}次)`
               : '本周期暂无调用';
-            let estNode = '待消耗 ≥1%';
-            if (est?.status === 'estimated') {
-              const tier = est.confidenceTier || (est.maxUsedPctObserved >= 10 ? 'high' : est.maxUsedPctObserved >= 3 ? 'mid' : 'low');
-              const confLabel = tier === 'high' ? '高置信' : tier === 'mid' ? '收敛中' : '样本偏少';
-              const confTip = `已观测最高消耗 ${est.maxUsedPctObserved ?? '?'}%，估算误差约 ±${est.relErrPct ?? '?'}%`;
-              estNode = [
-                h('span', { key: 'v' }, `~${fmtShortUsd(est.estTotalUsd)} (${fmtShortUsd(est.lowUsd)}–${fmtShortUsd(est.highUsd)})`),
-                h('span', { key: 'b', className: `agy-quota-conf is-${tier}`, title: confTip }, confLabel)
-              ];
-            } else if (est?.status === 'lower_bound') {
-              estNode = [
-                h('span', { key: 'v' }, `> ${fmtShortUsd(est.minBoundUsd)}`),
-                h('span', { key: 'b', className: 'agy-quota-conf is-low', title: '当前仍为 100% 满额，仅能确定总额下界' }, '仅下界')
-              ];
-            }
+            const buildEstNode = (e, prefix = '') => {
+              if (e?.status === 'estimated') {
+                const tier = e.confidenceTier || (e.maxUsedPctObserved >= 10 ? 'high' : e.maxUsedPctObserved >= 3 ? 'mid' : 'low');
+                const confLabel = tier === 'high' ? '高置信' : tier === 'mid' ? '收敛中' : '样本偏少';
+                const confTip = `${prefix}已观测最高消耗 ${e.maxUsedPctObserved ?? '?'}%，估算误差约 ±${e.relErrPct ?? '?'}%`;
+                return [
+                  h('span', { key: 'v' }, `~${fmtShortUsd(e.estTotalUsd)} (${fmtShortUsd(e.lowUsd)}–${fmtShortUsd(e.highUsd)})`),
+                  h('span', { key: 'b', className: `agy-quota-conf is-${tier}`, title: confTip }, confLabel)
+                ];
+              }
+              if (e?.status === 'lower_bound') {
+                return [
+                  h('span', { key: 'v' }, `> ${fmtShortUsd(e.minBoundUsd)}`),
+                  h('span', { key: 'b', className: 'agy-quota-conf is-low', title: '当前仍为 100% 满额，仅能确定总额下界' }, '仅下界')
+                ];
+              }
+              return '待消耗 ≥1%';
+            };
+            const hasPrev = prevEst?.status === 'estimated';
+            const estNode = buildEstNode(est, hasPrev ? '本周期' : '');
             return h(React.Fragment, null,
               h('div', { className: 'agy-quota-row' },
                 h('span', null, title),
@@ -2157,7 +2163,8 @@
                 h('i', { className: barClass, style: { width: `${Math.max(0, Math.min(100, leftPct))}%` } })
               ),
               h('div', { className: 'agy-quota-sub' }, h('span', null, '本周期实耗'), h('strong', null, spendText)),
-              h('div', { className: 'agy-quota-sub' }, h('span', null, '推算总额度'), h('strong', null, estNode))
+              h('div', { className: 'agy-quota-sub' }, h('span', null, hasPrev ? '本周期推算' : '推算总额度'), h('strong', null, estNode)),
+              hasPrev ? h('div', { className: 'agy-quota-sub' }, h('span', null, '上周期推算'), h('strong', null, buildEstNode(prevEst, '上周期'))) : null
             );
           };
 

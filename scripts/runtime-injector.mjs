@@ -92,13 +92,15 @@ function isConversationTarget(target) {
   }
 }
 
-const OVERLAY_VERSION = 'runtime-overlay-v38';
-let cachedOverlay = { mtimeMs: -1, source: '' };
+const DEFAULT_OVERLAY_VERSION = 'runtime-overlay-v39';
+let cachedOverlay = { mtimeMs: -1, source: '', version: DEFAULT_OVERLAY_VERSION };
 
 function getOverlayBundle() {
   const mtimeMs = fs.statSync(OVERLAY_FILE).mtimeMs;
-  if (cachedOverlay.mtimeMs !== mtimeMs) {
-    cachedOverlay = { mtimeMs, source: fs.readFileSync(OVERLAY_FILE, 'utf8') };
+  if (cachedOverlay.mtimeMs !== mtimeMs || !cachedOverlay.source) {
+    const source = fs.readFileSync(OVERLAY_FILE, 'utf8');
+    const m = source.match(/const\s+VERSION\s*=\s*['"]([^'"]+)['"]/);
+    cachedOverlay = { mtimeMs, source, version: m ? m[1] : DEFAULT_OVERLAY_VERSION };
   }
   return cachedOverlay;
 }
@@ -188,8 +190,8 @@ async function readRuntimeState(target, sinceRevision = '') {
   throw new Error(`runtime state endpoints returned ${lastStatus}`);
 }
 
-async function syncTargetOverlay(target, payload) {
-  const versionLiteral = JSON.stringify(OVERLAY_VERSION);
+async function syncTargetOverlay(target, payload, overlayVersion = DEFAULT_OVERLAY_VERSION) {
+  const versionLiteral = JSON.stringify(overlayVersion);
   const body = payload?.unchanged
     ? `const tickRes=typeof overlay.tick==='function'?overlay.tick(${JSON.stringify(payload.revision || '')}):{needUpdate:true};return{needInject:false,needUpdate:Boolean(tickRes?.needUpdate),forkRequests:typeof overlay.drainForkRequests==='function'?overlay.drainForkRequests():[],quotaSamples:typeof overlay.drainQuotaSamples==='function'?overlay.drainQuotaSamples():[]};`
     : `overlay.update(${JSON.stringify(payload)});return{needInject:false,needUpdate:false,forkRequests:typeof overlay.drainForkRequests==='function'?overlay.drainForkRequests():[],quotaSamples:typeof overlay.drainQuotaSamples==='function'?overlay.drainQuotaSamples():[]};`;
@@ -242,7 +244,7 @@ async function scanOnce() {
   const baseUrl = readDevtoolsAddress();
   if (!baseUrl) throw new Error(`DevToolsActivePort not found: ${DEVTOOLS_PORT_FILES.join(', ')}`);
   validateApiBase();
-  const { mtimeMs: overlayRevision, source: overlaySource } = getOverlayBundle();
+  const { mtimeMs: overlayRevision, source: overlaySource, version: overlayVersion } = getOverlayBundle();
   const targets = (await listTargets(baseUrl)).filter(isConversationTarget);
   const liveIds = new Set(targets.map(target => target.id));
   for (const id of TARGETS.keys()) {
@@ -260,17 +262,17 @@ async function scanOnce() {
         console.log(`[agy-model-inspector] overlay attached: ${target.id} ${target.url}`);
       }
       let payload = await readRuntimeState(target, known.lastRevision || '');
-      let sync = payload ? await syncTargetOverlay(target, payload) : null;
+      let sync = payload ? await syncTargetOverlay(target, payload, overlayVersion) : null;
       if (sync?.needInject) {
         await injectTarget(target, overlaySource);
         known.overlayRevision = overlayRevision;
         known.lastRevision = '';
         attached += 1;
         if (!payload || payload.unchanged) payload = await readRuntimeState(target, '');
-        if (payload) sync = await syncTargetOverlay(target, payload);
+        if (payload) sync = await syncTargetOverlay(target, payload, overlayVersion);
       } else if (sync?.needUpdate) {
         payload = await readRuntimeState(target, '');
-        if (payload) sync = await syncTargetOverlay(target, payload);
+        if (payload) sync = await syncTargetOverlay(target, payload, overlayVersion);
       }
       if (payload?.revision) {
         known.lastRevision = String(payload.revision);
@@ -282,7 +284,7 @@ async function scanOnce() {
         if (stored) {
           payload = await readRuntimeState(target, '');
           if (payload) {
-            await syncTargetOverlay(target, payload);
+            await syncTargetOverlay(target, payload, overlayVersion);
             if (payload.revision) known.lastRevision = String(payload.revision);
           }
         }
