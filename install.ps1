@@ -145,6 +145,10 @@ module.exports = require(path.join(asarPath, mainRel));
     }
 
     $dstDll = Join-Path $AppRoot 'DWrite.dll'
+    # Also keep a copy inside the installed plugin directory so DWrite.dll can self-update on future releases.
+    $pluginNativeDir = Join-Path $PluginDir 'native'
+    New-Item -ItemType Directory -Path $pluginNativeDir -Force | Out-Null
+    Copy-Item -LiteralPath $srcDll -Destination (Join-Path $pluginNativeDir 'DWrite.dll') -Force
     $oldDll = Join-Path $AppRoot 'DWrite.dll.old'
     if (Test-Path -LiteralPath $oldDll) {
         Remove-Item -LiteralPath $oldDll -Force -ErrorAction SilentlyContinue
@@ -287,13 +291,22 @@ New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
 $configPath = Join-Path $dataDir 'config.json'
 if (-not (Test-Path -LiteralPath $configPath)) {
     @{
-        badgeMode          = 'off'
-        tpsMode            = 'decode'
-        showTokenDetails   = $true
-        showTTFT           = $true
-        showInternalEnum   = $true
-        nativePromptPython = ''
+        badgeMode             = 'off'
+        tpsMode               = 'decode'
+        showTokenDetails      = $true
+        showTTFT              = $true
+        showInternalEnum      = $true
+        nativePromptPython    = ''
+        disableAutoDllInstall = [bool]$NoDllLoader
     } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $configPath -Encoding utf8NoBOM
+} else {
+    try {
+        $existingCfg = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
+        if ($existingCfg -is [hashtable]) {
+            $existingCfg['disableAutoDllInstall'] = [bool]$NoDllLoader
+            $existingCfg | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $configPath -Encoding utf8NoBOM
+        }
+    } catch {}
 }
 
 Write-Host "Installed plugin to: $targetDir" -ForegroundColor Green

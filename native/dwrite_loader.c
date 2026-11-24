@@ -5,10 +5,17 @@
  *    via PE export forwarding (resolved by ntdll before Chromium sandbox
  *    token lowering).
  * 2. In the Antigravity.exe main browser process only (never renderer/GPU or
- *    ELECTRON_RUN_AS_NODE child processes):
- *    - Checks that the AGY Context plugin script exists in %USERPROFILE%.
- *    - Auto-recreates resources\app\{package.json,index.cjs} if an Antigravity
- *      auto-update cleared resources\app (self-healing across updates).
+ *    ELECTRON_RUN_AS_NODE child processes), using kernel32.lib ONLY (zero
+ *    extra DLL imports, safe under DllMain loader lock and compatible with
+ *    co-located version.dll proxies):
+ *    - Cleans up leftover DWrite.dll.old* files from prior hot-swaps.
+ *    - Checks %USERPROFILE%\.gemini\config\plugins\agy-model-inspector\native\DWrite.dll
+ *      and atomically self-updates <exeDir>\DWrite.dll (with rollback on copy
+ *      failure) whenever a newer revision/build is available.
+ *    - Reads Antigravity's real version from resources\app.asar's root
+ *      package.json (with in-memory PE RT_VERSION VS_FIXEDFILEINFO fallback)
+ *      and keeps resources\app\{package.json,index.cjs} healed and version-
+ *      synced across every Antigravity update (never shows Version 0.0.0).
  *    - Installs a one-shot IAT redirect on Antigravity.exe's KERNEL32 file APIs
  *      so Electron's appSearchPaths skips resources\app.asar once and boots
  *      resources\app\index.cjs, which loads electron-overlay-loader.cjs and
@@ -16,19 +23,16 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winver.h>
 #include <wchar.h>
 #include <string.h>
 
 #pragma comment(linker, "/export:DWriteCreateFactory=C:\\Windows\\System32\\DWrite.DWriteCreateFactory,@1")
 
-static const char * const volatile AGY_CONTEXT_DLL_MARKER = "AGY_CONTEXT_DWRITE_LOADER_V1";
+#define AGY_CONTEXT_DLL_REV 2
 
-static const char BOOTSTRAP_PKG_JSON[] =
-    "{\n"
-    "  \"name\": \"antigravity\",\n"
-    "  \"productName\": \"Antigravity\",\n"
-    "  \"main\": \"index.cjs\"\n"
-    "}\n";
+static const char * const volatile AGY_CONTEXT_DLL_MARKER = "AGY_CONTEXT_DWRITE_LOADER_V1";
+static const char * const volatile AGY_CONTEXT_DLL_REV_MARKER = "AGY_CONTEXT_DWRITE_REV=0002";
 
 static const char BOOTSTRAP_INDEX_CJS[] =
     "'use strict';\n"
@@ -134,14 +138,544 @@ static int file_exists(const wchar_t *path) {
     return (attr != INVALID_FILE_ATTRIBUTES) && ((attr & FILE_ATTRIBUTE_DIRECTORY) == 0);
 }
 
-static int write_ascii_file(const wchar_t *path, const char *content) {
+static int read_file_exact(HANDLE h, void *buf, DWORD len) {
+    BYTE *dst = (BYTE *)buf;
+    DWORD done = 0;
+    while (done < len) {
+        DWORD chunk = 0;
+        if (!ReadFile(h, dst + done, len - done, &chunk, NULL) || chunk == 0) {
+            return 0;
+        }
+        done += chunk;
+    }
+    return 1;
+}
+
+static BYTE *read_entire_file(const wchar_t *path, DWORD minSize, DWORD maxSize, DWORD *outSize) {
+    if (outSize) *outSize = 0;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+
+    LARGE_INTEGER li;
+    if (!GetFileSizeEx(h, &li) || li.QuadPart < (LONGLONG)minSize || li.QuadPart > (LONGLONG)maxSize) {
+        CloseHandle(h);
+        return NULL;
+    }
+
+    DWORD sz = (DWORD)li.QuadPart;
+    BYTE *buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, (size_t)sz + 1);
+    if (!buf) {
+        CloseHandle(h);
+        return NULL;
+    }
+    if (!read_file_exact(h, buf, sz)) {
+        HeapFree(GetProcessHeap(), 0, buf);
+        CloseHandle(h);
+        return NULL;
+    }
+    CloseHandle(h);
+    buf[sz] = '\0';
+    if (outSize) *outSize = sz;
+    return buf;
+}
+
+static int file_matches_bytes(const wchar_t *path, const char *expected, size_t expectedLen) {
+    DWORD actualLen = 0;
+    BYTE *buf = read_entire_file(path, (DWORD)expectedLen, (DWORD)expectedLen, &actualLen);
+    if (!buf) return 0;
+    int eq = (actualLen == (DWORD)expectedLen) && (memcmp(buf, expected, expectedLen) == 0);
+    HeapFree(GetProcessHeap(), 0, buf);
+    return eq;
+}
+
+static int write_ascii_file(const wchar_t *path, const char *content, size_t totalLen) {
     HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    DWORD total = (DWORD)strlen(content);
     DWORD written = 0;
-    BOOL ok = WriteFile(h, content, total, &written, NULL);
+    BOOL ok = WriteFile(h, content, (DWORD)totalLen, &written, NULL);
     CloseHandle(h);
-    return ok && written == total;
+    return ok && written == (DWORD)totalLen;
+}
+
+static int append_str(char *dst, size_t cap, size_t *pos, const char *src) {
+    size_t slen = strlen(src);
+    if (*pos + slen >= cap) return 0;
+    memcpy(dst + *pos, src, slen);
+    *pos += slen;
+    dst[*pos] = '\0';
+    return 1;
+}
+
+static int append_uint(char *dst, size_t cap, size_t *pos, DWORD val) {
+    char tmp[16];
+    size_t n = 0;
+    if (val == 0) {
+        tmp[n++] = '0';
+    } else {
+        while (val > 0 && n < sizeof(tmp)) {
+            tmp[n++] = (char)('0' + (val % 10));
+            val /= 10;
+        }
+    }
+    if (*pos + n >= cap) return 0;
+    while (n > 0) {
+        dst[(*pos)++] = tmp[--n];
+    }
+    dst[*pos] = '\0';
+    return 1;
+}
+
+static void append_uint_w(wchar_t *dst, size_t cap, DWORD val) {
+    size_t pos = wcslen(dst);
+    wchar_t tmp[16];
+    size_t n = 0;
+    if (val == 0) {
+        tmp[n++] = L'0';
+    } else {
+        while (val > 0 && n < 16) {
+            tmp[n++] = (wchar_t)(L'0' + (val % 10));
+            val /= 10;
+        }
+    }
+    if (pos + n >= cap) return;
+    while (n > 0) {
+        dst[pos++] = tmp[--n];
+    }
+    dst[pos] = L'\0';
+}
+
+static int is_valid_version_str(const char *s, size_t len) {
+    if (len == 0 || len >= 48) return 0;
+    int hasDigit = 0;
+    for (size_t i = 0; i < len; ++i) {
+        char c = s[i];
+        if (c >= '0' && c <= '9') {
+            hasDigit = 1;
+        } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   c == '.' || c == '-' || c == '_' || c == '+') {
+            /* ok */
+        } else {
+            return 0;
+        }
+    }
+    return hasDigit;
+}
+
+/* Advance past a JSON string starting at p (where *p == '"'). Returns pointer after closing '"' or NULL. */
+static const char *skip_json_string(const char *p, const char *end) {
+    if (p >= end || *p != '"') return NULL;
+    ++p;
+    while (p < end) {
+        if (*p == '\\') {
+            p += 2;
+            continue;
+        }
+        if (*p == '"') return p + 1;
+        ++p;
+    }
+    return NULL;
+}
+
+/* Skip JSON whitespace. */
+static const char *skip_ws(const char *p, const char *end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    return p;
+}
+
+/* Extract a JSON string value for key `wantKey` at exact brace depth `wantDepth`. */
+static int json_find_string_at_depth(const char *json, size_t len, int wantDepth, const char *wantKey, char *out, size_t outCap) {
+    const char *p = json;
+    const char *end = json + len;
+    size_t wantKeyLen = strlen(wantKey);
+    int depth = 0;
+
+    while (p < end) {
+        char c = *p;
+        if (c == '{') {
+            ++depth;
+            ++p;
+        } else if (c == '}') {
+            if (depth > 0) --depth;
+            ++p;
+        } else if (c == '"') {
+            const char *keyStart = p + 1;
+            const char *afterKey = skip_json_string(p, end);
+            if (!afterKey) return 0;
+            size_t keyLen = (size_t)((afterKey - 1) - keyStart);
+            const char *q = skip_ws(afterKey, end);
+            if (q < end && *q == ':') {
+                q = skip_ws(q + 1, end);
+                if (depth == wantDepth && keyLen == wantKeyLen && memcmp(keyStart, wantKey, wantKeyLen) == 0) {
+                    if (q < end && *q == '"') {
+                        const char *vStart = q + 1;
+                        const char *vEnd = skip_json_string(q, end);
+                        if (!vEnd) return 0;
+                        size_t vLen = (size_t)((vEnd - 1) - vStart);
+                        if (vLen >= outCap) return 0;
+                        memcpy(out, vStart, vLen);
+                        out[vLen] = '\0';
+                        return 1;
+                    }
+                    return 0;
+                }
+                p = q;
+            } else {
+                p = afterKey;
+            }
+        } else {
+            ++p;
+        }
+    }
+    return 0;
+}
+
+/* Extract unsigned integer value (either numeric or quoted decimal) for key `wantKey` at depth 1 inside an object slice. */
+static int json_find_uint64_shallow(const char *obj, size_t len, const char *wantKey, ULONGLONG *outVal) {
+    const char *p = obj;
+    const char *end = obj + len;
+    size_t wantKeyLen = strlen(wantKey);
+    int depth = 0;
+
+    while (p < end) {
+        char c = *p;
+        if (c == '{') {
+            ++depth;
+            ++p;
+        } else if (c == '}') {
+            if (depth > 0) --depth;
+            ++p;
+        } else if (c == '"') {
+            const char *keyStart = p + 1;
+            const char *afterKey = skip_json_string(p, end);
+            if (!afterKey) return 0;
+            size_t keyLen = (size_t)((afterKey - 1) - keyStart);
+            const char *q = skip_ws(afterKey, end);
+            if (q < end && *q == ':') {
+                q = skip_ws(q + 1, end);
+                if (depth == 1 && keyLen == wantKeyLen && memcmp(keyStart, wantKey, wantKeyLen) == 0) {
+                    if (q < end && *q == '"') ++q;
+                    if (q >= end || *q < '0' || *q > '9') return 0;
+                    ULONGLONG v = 0;
+                    while (q < end && *q >= '0' && *q <= '9') {
+                        v = v * 10 + (ULONGLONG)(*q - '0');
+                        ++q;
+                    }
+                    *outVal = v;
+                    return 1;
+                }
+                p = q;
+            } else {
+                p = afterKey;
+            }
+        } else {
+            ++p;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Locate root "package.json" inside app.asar (brace depth == 2, direct child of top-level "files")
+ * and read its "version" string.
+ */
+static int read_version_from_asar(const wchar_t *asarPath, char *verOut, size_t verCap) {
+    HANDLE h = CreateFileW(asarPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    DWORD hdr[4];
+    if (!read_file_exact(h, hdr, sizeof(hdr))) {
+        CloseHandle(h);
+        return 0;
+    }
+    DWORD jsonLen = hdr[3];
+    if (hdr[0] != 4 || hdr[1] < 8 || jsonLen < 16 || jsonLen > 4 * 1024 * 1024) {
+        CloseHandle(h);
+        return 0;
+    }
+    ULONGLONG dataOffset = 8ULL + (ULONGLONG)hdr[1];
+
+    char *jsonBuf = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)jsonLen + 1);
+    if (!jsonBuf) {
+        CloseHandle(h);
+        return 0;
+    }
+    if (!read_file_exact(h, jsonBuf, jsonLen)) {
+        HeapFree(GetProcessHeap(), 0, jsonBuf);
+        CloseHandle(h);
+        return 0;
+    }
+    jsonBuf[jsonLen] = '\0';
+
+    /* Find `"package.json":{...}` at brace depth == 2 (root entry under `"files"`). */
+    const char *p = jsonBuf;
+    const char *end = jsonBuf + jsonLen;
+    int depth = 0;
+    ULONGLONG pkgSize = 0;
+    ULONGLONG pkgOffset = 0;
+    int foundEntry = 0;
+
+    while (p < end) {
+        char c = *p;
+        if (c == '{') {
+            ++depth;
+            ++p;
+        } else if (c == '}') {
+            if (depth > 0) --depth;
+            ++p;
+        } else if (c == '"') {
+            const char *keyStart = p + 1;
+            const char *afterKey = skip_json_string(p, end);
+            if (!afterKey) break;
+            size_t keyLen = (size_t)((afterKey - 1) - keyStart);
+            const char *q = skip_ws(afterKey, end);
+            if (q < end && *q == ':') {
+                q = skip_ws(q + 1, end);
+                if (depth == 2 && keyLen == 12 && memcmp(keyStart, "package.json", 12) == 0 && q < end && *q == '{') {
+                    const char *objStart = q;
+                    int subDepth = 0;
+                    const char *r = q;
+                    while (r < end) {
+                        if (*r == '"') {
+                            r = skip_json_string(r, end);
+                            if (!r) break;
+                            continue;
+                        }
+                        if (*r == '{') ++subDepth;
+                        else if (*r == '}') {
+                            --subDepth;
+                            if (subDepth == 0) { ++r; break; }
+                        }
+                        ++r;
+                    }
+                    if (r && r > objStart && subDepth == 0) {
+                        size_t objLen = (size_t)(r - objStart);
+                        if (json_find_uint64_shallow(objStart, objLen, "size", &pkgSize) &&
+                            json_find_uint64_shallow(objStart, objLen, "offset", &pkgOffset)) {
+                            foundEntry = 1;
+                        }
+                    }
+                    break;
+                }
+                p = q;
+            } else {
+                p = afterKey;
+            }
+        } else {
+            ++p;
+        }
+    }
+
+    HeapFree(GetProcessHeap(), 0, jsonBuf);
+    if (!foundEntry || pkgSize == 0 || pkgSize > 65536) {
+        CloseHandle(h);
+        return 0;
+    }
+
+    LARGE_INTEGER seekPos;
+    seekPos.QuadPart = (LONGLONG)(dataOffset + pkgOffset);
+    if (!SetFilePointerEx(h, seekPos, NULL, FILE_BEGIN)) {
+        CloseHandle(h);
+        return 0;
+    }
+
+    char *pkgBuf = (char *)HeapAlloc(GetProcessHeap(), 0, (size_t)pkgSize + 1);
+    if (!pkgBuf) {
+        CloseHandle(h);
+        return 0;
+    }
+    int ok = read_file_exact(h, pkgBuf, (DWORD)pkgSize);
+    CloseHandle(h);
+    if (!ok) {
+        HeapFree(GetProcessHeap(), 0, pkgBuf);
+        return 0;
+    }
+    pkgBuf[pkgSize] = '\0';
+
+    char tmpVer[64];
+    int gotVer = json_find_string_at_depth(pkgBuf, (size_t)pkgSize, 1, "version", tmpVer, sizeof(tmpVer));
+    HeapFree(GetProcessHeap(), 0, pkgBuf);
+    if (!gotVer || !is_valid_version_str(tmpVer, strlen(tmpVer))) return 0;
+    if (strlen(tmpVer) >= verCap) return 0;
+    memcpy(verOut, tmpVer, strlen(tmpVer) + 1);
+    return 1;
+}
+
+/* Fallback: read VS_FIXEDFILEINFO directly from Antigravity.exe's in-memory RT_VERSION resource (kernel32 only). */
+static int read_version_from_exe_resource(char *verOut, size_t verCap) {
+    HMODULE hExe = GetModuleHandleW(NULL);
+    if (!hExe) return 0;
+    HRSRC hRes = FindResourceW(hExe, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16)); /* RT_VERSION = 16 */
+    if (!hRes) return 0;
+    DWORD sz = SizeofResource(hExe, hRes);
+    if (sz < sizeof(VS_FIXEDFILEINFO)) return 0;
+    HGLOBAL hData = LoadResource(hExe, hRes);
+    if (!hData) return 0;
+    const BYTE *ptr = (const BYTE *)LockResource(hData);
+    if (!ptr) return 0;
+
+    for (DWORD off = 0; off + sizeof(VS_FIXEDFILEINFO) <= sz; off += 4) {
+        const VS_FIXEDFILEINFO *ffi = (const VS_FIXEDFILEINFO *)(ptr + off);
+        if (ffi->dwSignature == VS_FFI_SIGNATURE) {
+            DWORD maj = HIWORD(ffi->dwProductVersionMS);
+            DWORD min = LOWORD(ffi->dwProductVersionMS);
+            DWORD pat = HIWORD(ffi->dwProductVersionLS);
+            DWORD bld = LOWORD(ffi->dwProductVersionLS);
+            if (maj == 0 && min == 0 && pat == 0) return 0;
+            size_t pos = 0;
+            if (!append_uint(verOut, verCap, &pos, maj)) return 0;
+            if (!append_str(verOut, verCap, &pos, ".")) return 0;
+            if (!append_uint(verOut, verCap, &pos, min)) return 0;
+            if (!append_str(verOut, verCap, &pos, ".")) return 0;
+            if (!append_uint(verOut, verCap, &pos, pat)) return 0;
+            if (bld != 0) {
+                if (!append_str(verOut, verCap, &pos, ".")) return 0;
+                if (!append_uint(verOut, verCap, &pos, bld)) return 0;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Remove leftover DWrite.dll.old* files from prior hot-swaps. */
+static void cleanup_old_dlls(const wchar_t *exeDir) {
+    wchar_t pattern[2048];
+    if (wcslen(exeDir) + 32 >= 2048) return;
+    wcscpy_s(pattern, 2048, exeDir);
+    wcscat_s(pattern, 2048, L"\\DWrite.dll.old*");
+
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(pattern, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+        wchar_t fullPath[2048];
+        if (wcslen(exeDir) + 1 + wcslen(fd.cFileName) + 1 < 2048) {
+            wcscpy_s(fullPath, 2048, exeDir);
+            wcscat_s(fullPath, 2048, L"\\");
+            wcscat_s(fullPath, 2048, fd.cFileName);
+            DeleteFileW(fullPath);
+        }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+}
+
+static int find_ascii_marker(const BYTE *buf, DWORD bufLen, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || bufLen < nlen) return -1;
+    DWORD limit = bufLen - (DWORD)nlen;
+    for (DWORD i = 0; i <= limit; ++i) {
+        if (buf[i] == (BYTE)needle[0] && memcmp(buf + i, needle, nlen) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int is_valid_pe64_dll(const BYTE *buf, DWORD len) {
+    if (len < sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS)) return 0;
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)buf;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if (dos->e_lfanew < 0 || (DWORD)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS) > len) return 0;
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(buf + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) == 0) return 0;
+    return 1;
+}
+
+static int parse_dll_rev(const BYTE *buf, DWORD len) {
+    const char *prefix = "AGY_CONTEXT_DWRITE_REV=";
+    int idx = find_ascii_marker(buf, len, prefix);
+    if (idx < 0) return 1; /* Rev 1 predated explicit REV marker */
+    size_t off = (size_t)idx + strlen(prefix);
+    int val = 0;
+    int digits = 0;
+    while (off < len && digits < 6 && buf[off] >= '0' && buf[off] <= '9') {
+        val = val * 10 + (int)(buf[off] - '0');
+        ++off;
+        ++digits;
+    }
+    return digits > 0 ? val : 1;
+}
+
+/*
+ * Check %USERPROFILE%\.gemini\config\plugins\agy-model-inspector\native\DWrite.dll.
+ * If a newer AGY Context DLL exists there, rename our currently loaded DLL aside and
+ * copy the new one in place (with rollback on failure) so the next launch loads it.
+ */
+static void maybe_self_update_dll(HINSTANCE hSelfDll, const wchar_t *exeDir, const wchar_t *userProfile) {
+    wchar_t selfPath[2048];
+    DWORD selfLen = GetModuleFileNameW(hSelfDll, selfPath, 2048);
+    if (selfLen == 0 || selfLen >= 2048) return;
+
+    wchar_t expectedSelf[2048];
+    if (wcslen(exeDir) + 16 >= 2048) return;
+    wcscpy_s(expectedSelf, 2048, exeDir);
+    wcscat_s(expectedSelf, 2048, L"\\DWrite.dll");
+    if (!path_equals_ci(selfPath, expectedSelf)) return;
+
+    const wchar_t *srcRel = L"\\.gemini\\config\\plugins\\agy-model-inspector\\native\\DWrite.dll";
+    wchar_t srcPath[2048];
+    if (wcslen(userProfile) + wcslen(srcRel) + 1 >= 2048) return;
+    wcscpy_s(srcPath, 2048, userProfile);
+    wcscat_s(srcPath, 2048, srcRel);
+    if (path_equals_ci(srcPath, selfPath)) return;
+
+    WIN32_FILE_ATTRIBUTE_DATA srcAttr;
+    WIN32_FILE_ATTRIBUTE_DATA selfAttr;
+    if (!GetFileAttributesExW(srcPath, GetFileExInfoStandard, &srcAttr)) return;
+    if (!GetFileAttributesExW(selfPath, GetFileExInfoStandard, &selfAttr)) return;
+    if ((srcAttr.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) return;
+
+    /* Fast path: identical size and LastWriteTime -> already synced, zero file reads. */
+    if (srcAttr.nFileSizeHigh == 0 && selfAttr.nFileSizeHigh == 0 &&
+        srcAttr.nFileSizeLow == selfAttr.nFileSizeLow &&
+        CompareFileTime(&srcAttr.ftLastWriteTime, &selfAttr.ftLastWriteTime) == 0) {
+        return;
+    }
+
+    DWORD srcBytesLen = 0;
+    BYTE *srcBytes = read_entire_file(srcPath, 16 * 1024, 2 * 1024 * 1024, &srcBytesLen);
+    if (!srcBytes) return;
+
+    int valid = is_valid_pe64_dll(srcBytes, srcBytesLen) &&
+                find_ascii_marker(srcBytes, srcBytesLen, "AGY_CONTEXT_DWRITE_LOADER_V1") >= 0;
+    int srcRev = valid ? parse_dll_rev(srcBytes, srcBytesLen) : 0;
+
+    int shouldUpdate = 0;
+    if (valid) {
+        if (srcRev > AGY_CONTEXT_DLL_REV) {
+            shouldUpdate = 1;
+        } else if (srcRev == AGY_CONTEXT_DLL_REV &&
+                   CompareFileTime(&srcAttr.ftLastWriteTime, &selfAttr.ftLastWriteTime) > 0) {
+            DWORD selfBytesLen = 0;
+            BYTE *selfBytes = read_entire_file(selfPath, 16 * 1024, 2 * 1024 * 1024, &selfBytesLen);
+            if (selfBytes) {
+                if (selfBytesLen != srcBytesLen || memcmp(selfBytes, srcBytes, srcBytesLen) != 0) {
+                    shouldUpdate = 1;
+                }
+                HeapFree(GetProcessHeap(), 0, selfBytes);
+            }
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, srcBytes);
+    if (!shouldUpdate) return;
+
+    wchar_t oldPath[2048];
+    if (wcslen(exeDir) + 40 >= 2048) return;
+    wcscpy_s(oldPath, 2048, exeDir);
+    wcscat_s(oldPath, 2048, L"\\DWrite.dll.old.");
+    append_uint_w(oldPath, 2048, GetCurrentProcessId());
+
+    if (!MoveFileExW(selfPath, oldPath, MOVEFILE_REPLACE_EXISTING)) {
+        return;
+    }
+    if (!CopyFileW(srcPath, selfPath, FALSE)) {
+        /* Roll back immediately so Antigravity is never left without DWrite.dll. */
+        MoveFileExW(oldPath, selfPath, MOVEFILE_REPLACE_EXISTING);
+    }
 }
 
 static int ensure_bootstrap_files(const wchar_t *exeDir) {
@@ -154,17 +688,35 @@ static int ensure_bootstrap_files(const wchar_t *exeDir) {
     wcscpy_s(pkgPath, 2048, appDir);
     wcscat_s(pkgPath, 2048, L"\\package.json");
 
-    if (file_exists(g_trigger_index) && file_exists(pkgPath)) {
-        return 1;
+    /* Resolve real Antigravity version from app.asar (with PE RT_VERSION fallback). */
+    char realVer[64];
+    realVer[0] = '\0';
+    if (!read_version_from_asar(g_target_asar, realVer, sizeof(realVer))) {
+        read_version_from_exe_resource(realVer, sizeof(realVer));
     }
 
+    char expectedPkg[512];
+    size_t pkgPos = 0;
+    expectedPkg[0] = '\0';
+    append_str(expectedPkg, sizeof(expectedPkg), &pkgPos, "{\n  \"name\": \"antigravity\",\n  \"productName\": \"Antigravity\",\n");
+    if (realVer[0] != '\0') {
+        append_str(expectedPkg, sizeof(expectedPkg), &pkgPos, "  \"version\": \"");
+        append_str(expectedPkg, sizeof(expectedPkg), &pkgPos, realVer);
+        append_str(expectedPkg, sizeof(expectedPkg), &pkgPos, "\",\n");
+    }
+    append_str(expectedPkg, sizeof(expectedPkg), &pkgPos, "  \"main\": \"index.cjs\"\n}\n");
+
     CreateDirectoryW(appDir, NULL);
-    if (!file_exists(pkgPath)) {
-        if (!write_ascii_file(pkgPath, BOOTSTRAP_PKG_JSON)) return 0;
+
+    if (!file_matches_bytes(pkgPath, expectedPkg, pkgPos)) {
+        if (!write_ascii_file(pkgPath, expectedPkg, pkgPos)) return 0;
     }
-    if (!file_exists(g_trigger_index)) {
-        if (!write_ascii_file(g_trigger_index, BOOTSTRAP_INDEX_CJS)) return 0;
+
+    size_t idxLen = strlen(BOOTSTRAP_INDEX_CJS);
+    if (!file_matches_bytes(g_trigger_index, BOOTSTRAP_INDEX_CJS, idxLen)) {
+        if (!write_ascii_file(g_trigger_index, BOOTSTRAP_INDEX_CJS, idxLen)) return 0;
     }
+
     return file_exists(g_trigger_index) && file_exists(pkgPath);
 }
 
@@ -273,7 +825,7 @@ static int patch_iat_entry(HMODULE hMod, const char *targetDll, const char *fnNa
     return 0;
 }
 
-static void maybe_install_asar_bypass(void) {
+static void maybe_install_asar_bypass(HINSTANCE hSelfDll) {
     wchar_t exePath[2048];
     DWORD exeLen = GetModuleFileNameW(NULL, exePath, 2048);
     if (exeLen == 0 || exeLen >= 2048) return;
@@ -296,20 +848,27 @@ static void maybe_install_asar_bypass(void) {
     size_t dirLen = (size_t)(lastSep - exePath);
     if (dirLen + 64 >= 2048) return;
 
+    wchar_t exeDir[2048];
+    wcsncpy_s(exeDir, 2048, exePath, dirLen);
+    exeDir[dirLen] = L'\0';
+
+    /* Clean up leftover DWrite.dll.old* from prior self-updates or reinstalls. */
+    cleanup_old_dlls(exeDir);
+
     /* Check plugin overlay loader exists before enabling redirect or recreating resources\app. */
     wchar_t userProfile[1024];
     DWORD upLen = GetEnvironmentVariableW(L"USERPROFILE", userProfile, 1024);
     if (upLen == 0 || upLen >= 1024) return;
+
+    /* Self-update DWrite.dll from plugin dir if a newer revision/build was installed. */
+    maybe_self_update_dll(hSelfDll, exeDir, userProfile);
+
     const wchar_t *pluginRel = L"\\.gemini\\config\\plugins\\agy-model-inspector\\scripts\\electron-overlay-loader.cjs";
     wchar_t pluginPath[2048];
     if (upLen + wcslen(pluginRel) + 1 >= 2048) return;
     wcscpy_s(pluginPath, 2048, userProfile);
     wcscat_s(pluginPath, 2048, pluginRel);
     if (!file_exists(pluginPath)) return;
-
-    wchar_t exeDir[2048];
-    wcsncpy_s(exeDir, 2048, exePath, dirLen);
-    exeDir[dirLen] = L'\0';
 
     wcscpy_s(g_target_asar, 2048, exeDir);
     wcscat_s(g_target_asar, 2048, L"\\resources\\app.asar");
@@ -318,7 +877,7 @@ static void maybe_install_asar_bypass(void) {
     wcscpy_s(g_trigger_index, 2048, exeDir);
     wcscat_s(g_trigger_index, 2048, L"\\resources\\app\\index.cjs");
 
-    /* Self-heal resources\app if an Antigravity auto-update wiped it. */
+    /* Self-heal and keep resources\app\package.json version synced with app.asar on every boot. */
     if (!ensure_bootstrap_files(exeDir)) return;
 
     HMODULE hExe = GetModuleHandleW(NULL);
@@ -335,9 +894,10 @@ static void maybe_install_asar_bypass(void) {
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     (void)lpvReserved;
     (void)AGY_CONTEXT_DLL_MARKER[0];
+    (void)AGY_CONTEXT_DLL_REV_MARKER[0];
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinstDLL);
-        maybe_install_asar_bypass();
+        maybe_install_asar_bypass(hinstDLL);
     }
     return TRUE;
 }
