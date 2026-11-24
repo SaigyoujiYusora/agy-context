@@ -226,11 +226,14 @@ function getPricingSignature() {
   return probes.map(([m, opts]) => probe(m, opts)).join('|');
 }
 
+const VALID_CID_RE = /^[a-zA-Z0-9_-]{1,100}$/;
+
 function isValidCachedInvocation(it) {
   return Boolean(
     it &&
     typeof it === 'object' &&
     Number.isFinite(it.ts) && it.ts > 0 &&
+    (it.dedupeKey === undefined || typeof it.dedupeKey === 'string') &&
     (it.pool === 'gemini' || it.pool === 'claude_gpt') &&
     typeof it.model === 'string' &&
     Number.isFinite(it.inputTokens) &&
@@ -240,6 +243,21 @@ function isValidCachedInvocation(it) {
     Number.isFinite(it.totalTokens) &&
     Number.isFinite(it.usd)
   );
+}
+
+function sanitizeCachedInvocation(it) {
+  return {
+    ts: it.ts,
+    dedupeKey: typeof it.dedupeKey === 'string' ? it.dedupeKey : '',
+    pool: it.pool,
+    model: it.model,
+    inputTokens: it.inputTokens,
+    cacheReadTokens: it.cacheReadTokens,
+    outputTokens: it.outputTokens,
+    thinkingTokens: it.thinkingTokens,
+    totalTokens: it.totalTokens,
+    usd: it.usd
+  };
 }
 
 function ensureDiskCacheLoaded() {
@@ -268,6 +286,7 @@ function ensureDiskCacheLoaded() {
     for (const [cid, entry] of Object.entries(parsed.entries)) {
       if (
         !cid ||
+        !VALID_CID_RE.test(cid) ||
         !entry ||
         typeof entry.stamp !== 'string' ||
         !Array.isArray(entry.items) ||
@@ -276,7 +295,14 @@ function ensureDiskCacheLoaded() {
         droppedInvalid = true;
         continue;
       }
-      dbInvocationsCache.set(cid, { stamp: entry.stamp, items: entry.items });
+      if (dbInvocationsCache.size >= MAX_DB_CACHE_ENTRIES) {
+        droppedInvalid = true;
+        break;
+      }
+      dbInvocationsCache.set(cid, {
+        stamp: entry.stamp,
+        items: entry.items.map(sanitizeCachedInvocation)
+      });
     }
     if (droppedInvalid) {
       diskCacheDirty = true;
@@ -301,7 +327,7 @@ function flushDiskCacheSync() {
       if (oldestKey === undefined) break;
       dbInvocationsCache.delete(oldestKey);
     }
-    const entries = {};
+    const entries = Object.create(null);
     for (const [cid, entry] of dbInvocationsCache.entries()) {
       entries[cid] = { stamp: entry.stamp, items: entry.items };
     }
@@ -475,7 +501,7 @@ function sumPoolWindow(invocations, poolKey, startMs, endMs) {
   let usd = 0;
   let firstCallMs = 0;
   let lastCallMs = 0;
-  const byModel = {};
+  const byModel = Object.create(null);
 
   for (const inv of invocations) {
     if (inv.pool !== poolKey) continue;

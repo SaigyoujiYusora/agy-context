@@ -70,12 +70,35 @@ function readJsonBody(req) {
   });
 }
 
+const VALID_CID_RE = /^[a-zA-Z0-9_-]{1,100}$/;
+const LOOPBACK_HOST_RE = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i;
+const ALLOWED_CORS_ORIGIN_RE = /^(plugin:\/\/agy-model-inspector--panel-\d+|https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?)$/i;
+
+function resolveAllowedCorsOrigin(req) {
+  const origin = String(req?.headers?.origin || '').trim();
+  return origin && ALLOWED_CORS_ORIGIN_RE.test(origin) ? origin : '';
+}
+
+function sanitizeConversationId(raw) {
+  const s = String(raw || '').trim();
+  return s && VALID_CID_RE.test(s) ? s : '';
+}
+
+function isDisallowedCrossSiteMutation(req, corsOrigin) {
+  const origin = String(req?.headers?.origin || '').trim();
+  if (origin && !corsOrigin) return true;
+  if (!corsOrigin && req?.headers?.['sec-fetch-site'] === 'cross-site') return true;
+  return false;
+}
+
 function sendJson(res, status, obj) {
-  res.writeHead(status, {
+  const corsOrigin = res._agyCorsOrigin || '';
+  const headers = {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store, max-age=0',
-    'Access-Control-Allow-Origin': '*'
-  });
+    ...(corsOrigin ? { 'Access-Control-Allow-Origin': corsOrigin, Vary: 'Origin' } : {})
+  };
+  res.writeHead(status, headers);
   res.end(JSON.stringify(obj));
 }
 
@@ -107,13 +130,20 @@ function getActiveConversationId() {
 }
 
 function resolveTargetConversation(url, recent = null) {
-  const requestedId = url.searchParams.get('conversationId') || '';
-  const activeId = getActiveConversationId();
+  const requestedId = sanitizeConversationId(url.searchParams.get('conversationId'));
+  const activeId = sanitizeConversationId(getActiveConversationId());
   const list = recent || listRecentConversations(1);
-  return requestedId || activeId || list[0]?.conversationId || process.env.ANTIGRAVITY_CONVERSATION_ID || '';
+  return requestedId || activeId || sanitizeConversationId(list[0]?.conversationId) || sanitizeConversationId(process.env.ANTIGRAVITY_CONVERSATION_ID) || '';
 }
 
 async function handleRequest(req, res) {
+  const hostHeader = String(req.headers.host || '').trim();
+  if (hostHeader && !LOOPBACK_HOST_RE.test(hostHeader)) {
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Forbidden host');
+    return;
+  }
+  res._agyCorsOrigin = resolveAllowedCorsOrigin(req);
   const url = new URL(req.url || '/', `http://127.0.0.1:${port}`);
 
   if (['/api/prompt-profiles', '/api/prompt-sources', '/api/runtime-state', '/api/native-prompts', '/api/fork-turn', '/api/quota-sample', '/api/quota-stats', '/api/quota-refresh', '/api/update-check'].includes(url.pathname)) {
@@ -286,12 +316,20 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
+    const corsOrigin = res._agyCorsOrigin || '';
+    const headers = {
       'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
-      'Access-Control-Allow-Headers': '*',
-      'Access-Control-Max-Age': '86400'
-    });
+      'Access-Control-Allow-Headers': 'content-type',
+      'Access-Control-Max-Age': '86400',
+      ...(corsOrigin
+        ? {
+            'Access-Control-Allow-Origin': corsOrigin,
+            'Access-Control-Allow-Private-Network': 'true',
+            Vary: 'Origin'
+          }
+        : {})
+    };
+    res.writeHead(204, headers);
     res.end();
     return;
   }
@@ -385,6 +423,11 @@ async function handleRequest(req, res) {
   }
 
   if (url.pathname === '/api/set-config') {
+    if (isDisallowedCrossSiteMutation(req, res._agyCorsOrigin)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Forbidden origin');
+      return;
+    }
     const body = req.method === 'POST' ? await readJsonBody(req) : {};
     const tpsMode = url.searchParams.get('tpsMode') || body?.tpsMode;
     const patch = {};
@@ -409,8 +452,8 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === 'GET' && url.pathname === '/api/composer-stats') {
-    const requestedCid = (url.searchParams.get('conversationId') || '').trim();
-    const targetId = requestedCid || getActiveConversationId() || listRecentConversations(1)[0]?.conversationId || '';
+    const requestedCid = sanitizeConversationId(url.searchParams.get('conversationId'));
+    const targetId = requestedCid || sanitizeConversationId(getActiveConversationId()) || sanitizeConversationId(listRecentConversations(1)[0]?.conversationId) || '';
     const cfg = getPluginConfig();
     const inflight = targetId ? readInflightState(targetId) : null;
     const selected = targetId ? getConversationModelsFromDb(targetId) : null;
@@ -551,6 +594,11 @@ async function handleRequest(req, res) {
   }
 
   if (url.pathname === '/api/shutdown') {
+    if (isDisallowedCrossSiteMutation(req, res._agyCorsOrigin)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Forbidden origin');
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ ok: true, pid: process.pid }));
     setTimeout(() => process.exit(0), 40);

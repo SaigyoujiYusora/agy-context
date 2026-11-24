@@ -613,7 +613,14 @@ function enrichInvocationsModelAndTimestamps(invocations, stepTsMap, startIndex,
   return sentByEnum;
 }
 
+const VALID_CONVERSATION_ID_RE = /^[a-zA-Z0-9_-]{1,100}$/;
+
+function isValidConversationId(id) {
+  return typeof id === 'string' && VALID_CONVERSATION_ID_RE.test(id);
+}
+
 export function getConversationModelsFromDb(conversationId, precomputedDbStamp = '', _precomputedSummariesStamp = '') {
+  if (!isValidConversationId(conversationId)) return null;
   const dbPath = path.join(CONVERSATIONS_DIR, `${conversationId}.db`);
   if (!precomputedDbStamp && !fs.existsSync(dbPath)) return null;
 
@@ -1850,10 +1857,11 @@ function computeTrendsAndEvents({ summary, timelineSnapshots, stepMetaByIdx, sys
  * strictly from compact `transcript.jsonl` + SQLite `summary` (never reads `transcript_full.jsonl`).
  */
 export function getSessionTranscriptAnalytics(conversationId, summary = null, options = {}) {
+  const safeCid = isValidConversationId(conversationId) ? conversationId : '';
   const includeBrowser = Boolean(options?.includeBrowser);
-  const resolvedSummary = summary || (conversationId ? getConversationModelsFromDb(conversationId) : null);
-  const transcriptFile = conversationId
-    ? path.join(BRAIN_DIR, conversationId, '.system_generated', 'logs', 'transcript.jsonl')
+  const resolvedSummary = summary || (safeCid ? getConversationModelsFromDb(safeCid) : null);
+  const transcriptFile = safeCid
+    ? path.join(BRAIN_DIR, safeCid, '.system_generated', 'logs', 'transcript.jsonl')
     : '';
 
   let stat = null;
@@ -2609,6 +2617,7 @@ export function getSessionTranscriptAnalytics(conversationId, summary = null, op
  * delegation briefs, inter-agent messages, and per-node context composition.
  */
 function parseFleetTranscriptCached(cid) {
+  if (!isValidConversationId(cid)) return null;
   const tf = path.join(BRAIN_DIR, cid, '.system_generated', 'logs', 'transcript.jsonl');
   if (!fs.existsSync(tf)) return null;
   let stamp = '';
@@ -2769,8 +2778,8 @@ export function getFleetHierarchy(conversationId) {
     for (const rn of rawNodes) {
       const parsed = parseFleetTranscriptCached(rn.conversationId);
       parsedTranscripts.push(parsed);
-      const dbPath = path.join(CONVERSATIONS_DIR, `${rn.conversationId}.db`);
-      const dbSt = fs.existsSync(dbPath) ? getFileStamp(dbPath) : '0';
+      const dbPath = isValidConversationId(rn.conversationId) ? path.join(CONVERSATIONS_DIR, `${rn.conversationId}.db`) : '';
+      const dbSt = dbPath && fs.existsSync(dbPath) ? getFileStamp(dbPath) : '0';
       nodeSigParts.push(`${rn.conversationId}:${rn.status || ''}:${rn.lastModifiedMs}:${JSON.stringify(rn.dbTitle)}:${JSON.stringify(rn.dbPreview)}:${dbSt}:${parsed?.stamp || '0'}`);
     }
     const recentSig = topRecentMulti.map(r => `${r.conversationId}:${r.childCount}:${JSON.stringify(r.title)}`).join(',');
